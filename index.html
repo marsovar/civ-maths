@@ -624,7 +624,7 @@ pre,code,.qvisual pre,.pbody pre,.example-block pre{overflow-wrap:normal!importa
 <div class="tp-online" id="tp-online-wrap" onclick="go('scoreboard')" title="Voir les joueurs — vert=sur cette page, orange=autre onglet" style="position:relative">
 <div class="tp-online-dot" id="tp-online-dot"></div>
 <span id="tp-online-n">—</span>
-<span style="font-size:8px;color:var(--t4)" id="tp-online-label"> sur la page</span>
+<span style="font-size:8px;color:var(--t4)" id="tp-online-label"> En ligne</span>
 <!-- tooltip avec avatars -->
 <div id="tp-online-tooltip" style="display:none;position:absolute;top:calc(100% + 8px);right:0;background:var(--s1);border:1px solid var(--bd2);border-radius:8px;box-shadow:var(--sh);padding:8px 10px;min-width:160px;z-index:500;pointer-events:none">
   <div style="font-family:var(--ff-mono);font-size:8px;color:var(--t4);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px">Présence temps réel</div>
@@ -3084,6 +3084,8 @@ async function sbPushMyStats(extra={}){
 }
 
 async function sbSetOffline(){
+  // Marque offline dans le KV mais ne retire PAS du scoreboard
+  // (la suppression du scoreboard se fait uniquement via sbLogout)
   if(!_currentUser || !_ablyReady) return;
   try{
     const prev = await storageGet(_currentUser.key, true);
@@ -3091,8 +3093,6 @@ async function sbSetOffline(){
     const d = JSON.parse(prev.value);
     d.online = false; d.lastSeen = Date.now();
     await storageSet(_currentUser.key, JSON.stringify(d), true);
-    // Retirer du cache local immédiatement
-    _usersCache = _usersCache.filter(u=>u.name!==_currentUser.name);
   }catch(e){}
 }
 
@@ -3118,7 +3118,7 @@ function updateOnlineCount(){
 
   // Label
   const lbl = document.getElementById('tp-online-label');
-  if(lbl) lbl.textContent = ' en ligne';
+  if(lbl) lbl.textContent = ' En ligne';
 
   // Tooltip
   const avatarsEl = document.getElementById('tp-online-avatars');
@@ -3237,12 +3237,13 @@ async function sbLogin(name, password=''){
   }
 
   _sbUserIndexed = false;
-  await sbPushMyStats();
-  await _presenceEnter();   // ← apparaît en ligne immédiatement
+  // Lancer présence + push stats EN PARALLÈLE pour connexion instantanée
   sbStartHeartbeat();
   updateSbUI();
   document.getElementById('sb-login-modal')?.remove();
   if(_currentView==='scoreboard') go('scoreboard');
+  // En arrière-plan : push stats + entrer dans la présence simultanément
+  Promise.all([sbPushMyStats(), _presenceEnter()]).catch(()=>{});
   return true;
 }
 
@@ -3253,8 +3254,18 @@ function _showLoginError(msg){
 
 async function sbLogout(){
   if(_currentUser){
-    await sbSetOffline();   // marque offline dans KV
-    await _presenceLeave(); // ← disparaît en ligne immédiatement
+    // Retirer physiquement du scoreboard (online=false + retrait cache)
+    try{
+      const prev = await storageGet(_currentUser.key, true);
+      if(prev){
+        const d = JSON.parse(prev.value);
+        d.online = false; d.lastSeen = Date.now();
+        await storageSet(_currentUser.key, JSON.stringify(d), true);
+      }
+    }catch(e){}
+    // Retirer du cache local → disparaît immédiatement du scoreboard
+    _usersCache = _usersCache.filter(u=>u.name!==_currentUser.name);
+    await _presenceLeave(); // disparaît du compteur en ligne
   }
   _currentUser = null;
   localStorage.removeItem('ecg_math_username');

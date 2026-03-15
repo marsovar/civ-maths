@@ -2763,7 +2763,14 @@ let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
 let _presenceLifecycleBound = false;
+let _presenceDesired = false, _presenceJoined = false;
 let _duelState = null;
+
+// Focus réel de l'onglet/fenêtre — même logique que le scoreboard de index
+let _tabFocused = !document.hidden && document.hasFocus();
+document.addEventListener('visibilitychange', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
+window.addEventListener('focus', ()=>{ _tabFocused = !document.hidden && document.hasFocus(); });
+window.addEventListener('blur', ()=>{ _tabFocused = false; });
 
 const POLL_INTERVAL_ACTIVE = 8000;
 const POLL_INTERVAL_NORMAL = 15000;
@@ -2801,6 +2808,18 @@ function onlineStatusHtml(u){
 async function _hashPassword(pw){
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw));
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
+}
+
+function _shouldBePresent(){
+  return !!(_ablyReady && _currentUser && !document.hidden && _tabFocused);
+}
+
+async function _syncPresence(force=false){
+  const should = _shouldBePresent();
+  if(!force && should === _presenceDesired) return;
+  _presenceDesired = should;
+  if(should) await _presenceEnter();
+  else await _presenceLeave();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -2914,7 +2933,7 @@ function _setupAbly(resolve){
     _ably.connection.on('disconnected', () => { _ablyReady = false; });
     _ably.connection.on('failed',       () => { console.warn('[Ably] connection failed'); resolve(); });
     // Reconnexion automatique : Ably gère ça nativement
-    _ably.connection.on('connected',    () => { _ablyReady = true; });
+    _ably.connection.on('connected',    () => { _ablyReady = true; _syncPresence(true); });
 
   }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
 }
@@ -2923,41 +2942,42 @@ function _setupAbly(resolve){
 //  PRÉSENCE — basée sur le NOM (pas clientId aléatoire)
 // ══════════════════════════════════════════════════════════════════
 function _isPagePresent(){
-  return !!(_currentUser && _ablyReady && document.visibilityState === 'visible' && document.hasFocus());
+  return _shouldBePresent();
 }
 
 async function _presenceEnter(){
-  if(!_ablyReady || !_currentUser || !_isPagePresent()) return;
+  if(!_ablyReady || !_currentUser) return;
   try{
     const ch = _ablyChannel('ecg:presence');
     const data = {
       name: _currentUser.name,
       color: _currentUser.color,
       ts: Date.now(),
-      visible: document.visibilityState === 'visible',
-      focused: document.hasFocus()
+      visible: !document.hidden,
+      focused: _tabFocused
     };
-    // enter() — si déjà entré ça lève une erreur qu'on ignore
-    try{ await ch.presence.enter(data); }
+    if(_presenceJoined){
+      try{ await ch.presence.update(data); }catch(e){}
+      return;
+    }
+    try{ await ch.presence.enter(data); _presenceJoined = true; }
     catch(e){
-      // Déjà entré → update
-      try{ await ch.presence.update(data); }catch(e2){}
+      try{ await ch.presence.update(data); _presenceJoined = true; }catch(e2){}
     }
   }catch(e){}
 }
 
 async function _presenceLeave(){
-  if(!_ablyReady) return;
+  if(!_ablyReady){ _presenceJoined = false; return; }
+  if(!_presenceJoined && !_currentUser) return;
   try{ await _ablyChannel('ecg:presence').presence.leave(); }catch(e){}
-  // Supprimer localement immédiatement
+  _presenceJoined = false;
   if(_currentUser) delete _presenceMembers[_currentUser.name];
   updateOnlineCount();
 }
 
-async function _syncPresenceFromVisibility(){
-  if(!_currentUser || !_ablyReady) return;
-  if(_isPagePresent()) await _presenceEnter();
-  else await _presenceLeave();
+async function _syncPresenceFromVisibility(force=false){
+  await _syncPresence(force);
 }
 
 function _onPresenceEvent(member){
@@ -2966,7 +2986,6 @@ function _onPresenceEvent(member){
   if(member.action === 'leave' || member.action === 'absent'){
     delete _presenceMembers[name];
   } else {
-    // enter / update / present
     _presenceMembers[name] = member.data;
   }
   updateOnlineCount();
@@ -3086,20 +3105,30 @@ function sbStartHeartbeat(){
 
     // Quitter la présence proprement dès que la page n'est plus réellement présente
     window.addEventListener('beforeunload', () => {
+      _presenceDesired = false;
       if(_currentUser) _presenceLeave();
     });
     window.addEventListener('pagehide', () => {
+      _presenceDesired = false;
       if(_currentUser) _presenceLeave();
     });
 
     // Présence = onglet visible + fenêtre active
     document.addEventListener('visibilitychange', () => {
-      _syncPresenceFromVisibility();
+      _tabFocused = !document.hidden && document.hasFocus();
+      _usersCacheTs = 0;
+      if(document.hidden) sbPushMyStats();
+      _syncPresenceFromVisibility(true);
     });
     window.addEventListener('focus', () => {
+      _tabFocused = !document.hidden && document.hasFocus();
+      _usersCacheTs = 0;
+      sbPushMyStats();
       _syncPresenceFromVisibility();
     });
     window.addEventListener('blur', () => {
+      _tabFocused = false;
+      sbPushMyStats();
       _syncPresenceFromVisibility();
     });
   }
@@ -3127,7 +3156,7 @@ async function sbPushMyStats(extra={}){
       pwHash:    _currentUser.pwHash||prevData.pwHash||'',
       lastSeen:  Date.now(),
       updatedAt: Date.now(),
-      online:    _isPagePresent(),
+      online:    _shouldBePresent(),
       scoreboardActive: true,
       scores,
       streak:      getStreak(),
@@ -3156,20 +3185,22 @@ function _onAblyUserUpdate(value){
     const u = JSON.parse(value);
     if(!u?.name) return;
 
-    if(u.scoreboardActive === false){
-      _usersCache = _usersCache.filter(x=>x.name!==u.name);
-      _usersCacheTs = Date.now();
-      const sbContent = document.getElementById('sb-content');
-      if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
-      return;
+    const isActive = u.scoreboardActive !== false;
+    const idx = _usersCache.findIndex(x=>x.name===u.name);
+
+    if(isActive){
+      if(idx>=0) _usersCache[idx] = u;
+      else _usersCache.push(u);
+    } else if(idx>=0){
+      _usersCache.splice(idx, 1);
     }
 
-    const idx = _usersCache.findIndex(x=>x.name===u.name);
-    if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
-    _usersCache = _usersCache.filter(x=>x.scoreboardActive !== false);
+    _usersCache = _usersCache.filter(x=>x && x.scoreboardActive !== false);
     _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs = Date.now();
-    _patchScoreboardRow(u);
+
+    const sbContent = document.getElementById('sb-content');
+    if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
   }catch(e){}
 }
 
@@ -3365,13 +3396,15 @@ async function sbLogin(name, password=''){
   }
 
   _sbUserIndexed = false;
+  _presenceDesired = false;
+  _presenceJoined = false;
   updateSbUI();
   document.getElementById('sb-login-modal')?.remove();
   if(_currentView==='scoreboard') go('scoreboard');
 
-  // Connexion instantanée : présence réelle de page + stats en parallèle
-  Promise.all([_syncPresenceFromVisibility(), sbPushMyStats()]).catch(()=>{});
   sbStartHeartbeat();
+  // Connexion instantanée : même logique que index
+  Promise.all([sbPushMyStats({scoreboardActive:true}), _syncPresence(true)]).catch(()=>{});
   // Charger l'historique chat pour cet utilisateur
   _loadChatHistory();
   chatRenderFooter();
@@ -3386,6 +3419,7 @@ function _showLoginError(msg){
 async function sbLogout(){
   if(_currentUser){
     const prevUser = {..._currentUser};
+    _presenceDesired = false;
     await _presenceLeave(); // quitte la présence Ably immédiatement
 
     // Masquer du scoreboard uniquement sur déconnexion explicite
@@ -3408,6 +3442,8 @@ async function sbLogout(){
     _usersCache = _usersCache.filter(u=>u.name!==prevUser.name);
   }
   _currentUser = null;
+  _presenceDesired = false;
+  _presenceJoined = false;
   localStorage.removeItem('ecg_math_username');
   localStorage.removeItem('ecg_math_pwhash');
   _sbUserIndexed = false;

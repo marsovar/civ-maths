@@ -2762,6 +2762,7 @@ let _kv            = {};
 let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
+let _presenceLifecycleBound = false;
 let _duelState = null;
 
 const POLL_INTERVAL_ACTIVE = 8000;
@@ -2921,11 +2922,21 @@ function _setupAbly(resolve){
 // ══════════════════════════════════════════════════════════════════
 //  PRÉSENCE — basée sur le NOM (pas clientId aléatoire)
 // ══════════════════════════════════════════════════════════════════
+function _isPagePresent(){
+  return !!(_currentUser && _ablyReady && document.visibilityState === 'visible' && document.hasFocus());
+}
+
 async function _presenceEnter(){
-  if(!_ablyReady || !_currentUser) return;
+  if(!_ablyReady || !_currentUser || !_isPagePresent()) return;
   try{
     const ch = _ablyChannel('ecg:presence');
-    const data = { name: _currentUser.name, color: _currentUser.color, ts: Date.now() };
+    const data = {
+      name: _currentUser.name,
+      color: _currentUser.color,
+      ts: Date.now(),
+      visible: document.visibilityState === 'visible',
+      focused: document.hasFocus()
+    };
     // enter() — si déjà entré ça lève une erreur qu'on ignore
     try{ await ch.presence.enter(data); }
     catch(e){
@@ -2941,6 +2952,12 @@ async function _presenceLeave(){
   // Supprimer localement immédiatement
   if(_currentUser) delete _presenceMembers[_currentUser.name];
   updateOnlineCount();
+}
+
+async function _syncPresenceFromVisibility(){
+  if(!_currentUser || !_ablyReady) return;
+  if(_isPagePresent()) await _presenceEnter();
+  else await _presenceLeave();
 }
 
 function _onPresenceEvent(member){
@@ -3064,17 +3081,30 @@ function sbStartHeartbeat(){
   }
   _scheduleNext();
 
-  // beforeunload — quitter la présence proprement
-  window.addEventListener('beforeunload', () => {
-    if(_currentUser) _presenceLeave();
-  });
+  if(!_presenceLifecycleBound){
+    _presenceLifecycleBound = true;
 
-  // Retour au premier plan — re-enter presence au cas où la connexion a été perdue
-  document.addEventListener('visibilitychange', () => {
-    if(!document.hidden){
-      if(_currentUser && _ablyReady) _presenceEnter();
-    }
-  });
+    // Quitter la présence proprement dès que la page n'est plus réellement présente
+    window.addEventListener('beforeunload', () => {
+      if(_currentUser) _presenceLeave();
+    });
+    window.addEventListener('pagehide', () => {
+      if(_currentUser) _presenceLeave();
+    });
+
+    // Présence = onglet visible + fenêtre active
+    document.addEventListener('visibilitychange', () => {
+      _syncPresenceFromVisibility();
+    });
+    window.addEventListener('focus', () => {
+      _syncPresenceFromVisibility();
+    });
+    window.addEventListener('blur', () => {
+      _syncPresenceFromVisibility();
+    });
+  }
+
+  _syncPresenceFromVisibility();
 }
 
 // ─── Push stats ─────────────────────────────────────────────────
@@ -3096,7 +3126,9 @@ async function sbPushMyStats(extra={}){
       color:     _currentUser.color,
       pwHash:    _currentUser.pwHash||prevData.pwHash||'',
       lastSeen:  Date.now(),
-      online:    true,
+      updatedAt: Date.now(),
+      online:    _isPagePresent(),
+      scoreboardActive: true,
       scores,
       streak:      getStreak(),
       bestStreak:  Math.max(_getStoredBestStreak(), prevData.bestStreak||0, _sessionBestStreak||0),
@@ -3122,8 +3154,19 @@ async function sbPushMyStats(extra={}){
 function _onAblyUserUpdate(value){
   try{
     const u = JSON.parse(value);
+    if(!u?.name) return;
+
+    if(u.scoreboardActive === false){
+      _usersCache = _usersCache.filter(x=>x.name!==u.name);
+      _usersCacheTs = Date.now();
+      const sbContent = document.getElementById('sb-content');
+      if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
+      return;
+    }
+
     const idx = _usersCache.findIndex(x=>x.name===u.name);
     if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
+    _usersCache = _usersCache.filter(x=>x.scoreboardActive !== false);
     _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs = Date.now();
     _patchScoreboardRow(u);
@@ -3135,14 +3178,42 @@ async function _fetchAllUsers(force=false){
   const now = Date.now();
   if(!force && _usersCache.length && (now-_usersCacheTs)<USERS_CACHE_TTL) return _usersCache;
   try{
-    const idxRaw = await storageGet('ecg_math_users:index', true);
-    if(!idxRaw) return _usersCache;
-    const idx = JSON.parse(idxRaw.value);
-    if(!idx.keys?.length) return _usersCache;
-    const raws = await Promise.all(idx.keys.map(k=>storageGet(k,true).catch(()=>null)));
-    const users = [];
-    raws.forEach(raw=>{ if(raw) try{ users.push(JSON.parse(raw.value)); }catch(e){} });
-    // Tous les users restent dans le scoreboard — seul sbLogout retire
+    const listResult = await storageList('ecg_math_users:', true);
+    const idxRaw = await storageGet('ecg_math_users:index', true).catch(()=>null);
+
+    const keySet = new Set((listResult?.keys||[]).filter(k => k !== 'ecg_math_users:index'));
+    if(idxRaw){
+      try{
+        const idx = JSON.parse(idxRaw.value);
+        (idx.keys||[]).forEach(k => { if(k && k !== 'ecg_math_users:index') keySet.add(k); });
+      }catch(e){}
+    }
+
+    const keys = Array.from(keySet);
+    if(!keys.length){
+      _usersCache = [];
+      _usersCacheTs = now;
+      const sbContent = document.getElementById('sb-content');
+      if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
+      return _usersCache;
+    }
+
+    const raws = await Promise.all(keys.map(k=>storageGet(k,true).catch(()=>null)));
+    const byName = new Map();
+    raws.forEach(raw=>{
+      if(!raw) return;
+      try{
+        const u = JSON.parse(raw.value);
+        if(!u?.name) return;
+        const prev = byName.get(u.name);
+        const uts = u.updatedAt || u.lastSeen || 0;
+        const pts = prev ? (prev.updatedAt || prev.lastSeen || 0) : -1;
+        if(!prev || uts >= pts) byName.set(u.name, u);
+      }catch(e){}
+    });
+
+    const users = Array.from(byName.values()).filter(u => u.scoreboardActive !== false);
+    // Tous les users restent dans le scoreboard — seul sbLogout les masque explicitement
     _usersCache = users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs = now;
     // Mettre à jour le scoreboard si ouvert
@@ -3298,8 +3369,8 @@ async function sbLogin(name, password=''){
   document.getElementById('sb-login-modal')?.remove();
   if(_currentView==='scoreboard') go('scoreboard');
 
-  // Connexion instantanée : présence + stats en parallèle
-  Promise.all([_presenceEnter(), sbPushMyStats()]).catch(()=>{});
+  // Connexion instantanée : présence réelle de page + stats en parallèle
+  Promise.all([_syncPresenceFromVisibility(), sbPushMyStats()]).catch(()=>{});
   sbStartHeartbeat();
   // Charger l'historique chat pour cet utilisateur
   _loadChatHistory();
@@ -3314,18 +3385,27 @@ function _showLoginError(msg){
 
 async function sbLogout(){
   if(_currentUser){
+    const prevUser = {..._currentUser};
     await _presenceLeave(); // quitte la présence Ably immédiatement
-    // Retirer de l'index KV → plus dans le scoreboard pour tout le monde
+
+    // Masquer du scoreboard uniquement sur déconnexion explicite
     try{
-      const idxRaw = await storageGet('ecg_math_users:index', true);
-      if(idxRaw){
-        const idx = JSON.parse(idxRaw.value);
-        idx.keys = idx.keys.filter(k => k !== _currentUser.key);
-        await storageSet('ecg_math_users:index', JSON.stringify(idx), true);
-      }
+      const prev = await storageGet(prevUser.key, true);
+      const prevData = prev ? JSON.parse(prev.value) : {};
+      await storageSet(prevUser.key, JSON.stringify({
+        ...prevData,
+        name: prevUser.name,
+        color: prevUser.color,
+        pwHash: prevData.pwHash || prevUser.pwHash || '',
+        online: false,
+        scoreboardActive: false,
+        lastSeen: Date.now(),
+        updatedAt: Date.now()
+      }), true);
     }catch(e){}
+
     // Retirer du cache local immédiatement
-    _usersCache = _usersCache.filter(u=>u.name!==_currentUser.name);
+    _usersCache = _usersCache.filter(u=>u.name!==prevUser.name);
   }
   _currentUser = null;
   localStorage.removeItem('ecg_math_username');

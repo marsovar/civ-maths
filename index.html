@@ -2799,17 +2799,30 @@ function onlineStatusHtml(u){
 }
 function hexToRgb(hex){ try{ return parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16); }catch(e){ return '100,100,100'; } }
 
-// ─── Ably Real-time Backend ──────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  ABLY REAL-TIME BACKEND
+//  - KV store broadcast (scoreboard, stats, chat, duels)
+//  - Presence native Ably (compteur en ligne INSTANTANE, zéro polling)
+//  - Auth par mot de passe (hash SHA-256, sync multi-appareils)
+// ══════════════════════════════════════════════════════════════════
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 let _ably = null;
 let _ablyReady = false;
 let _ablyChannels = {};
 let _kv = {};
+// Présence Ably — membres actifs en temps réel
+let _presenceMembers = {}; // clientId -> {name, color, focused}
 
 function _ablyChannel(name){
   if(!_ably) return null;
   if(!_ablyChannels[name]) _ablyChannels[name] = _ably.channels.get(name);
   return _ablyChannels[name];
+}
+
+// Hash SHA-256 pour mots de passe (jamais stocké en clair)
+async function _hashPassword(password){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
 }
 
 async function ablyInit(){
@@ -2825,9 +2838,14 @@ async function ablyInit(){
 
 function _setupAbly(resolve){
   try{
-    _ably = new Ably.Realtime({ key: ABLY_KEY, clientId: 'ecg-'+Math.random().toString(36).slice(2) });
-    _ably.connection.on('connected', ()=>{
+    _ably = new Ably.Realtime({
+      key: ABLY_KEY,
+      clientId: 'ecg-'+Math.random().toString(36).slice(2)
+    });
+    _ably.connection.on('connected', async ()=>{
       _ablyReady = true;
+
+      // Canal KV — données persistantes (scores, chat, duels)
       const kvCh = _ablyChannel('ecg:kv');
       kvCh.subscribe('set', (msg)=>{
         const {key, value} = msg.data;
@@ -2835,10 +2853,68 @@ function _setupAbly(resolve){
         if(key.startsWith('ecg_math_users:') && key !== 'ecg_math_users:index') _onAblyUserUpdate(key, value);
         if(key === 'ecg_math_chat:messages') _onAblyChatUpdate(value);
       });
+
+      // Canal Présence — qui est EN LIGNE maintenant (temps réel natif Ably)
+      const presenceCh = _ablyChannel('ecg:presence');
+      // Écouter tous les events de présence
+      presenceCh.presence.subscribe((member)=>{
+        _onPresenceEvent(member);
+      });
+      // Charger les membres déjà présents
+      try{
+        const members = await presenceCh.presence.get();
+        _presenceMembers = {};
+        members.forEach(m=>{ if(m.data) _presenceMembers[m.clientId] = m.data; });
+        updateOnlineCount();
+      }catch(e){}
+
       resolve();
     });
     _ably.connection.on('failed', ()=>{ console.warn('Ably connection failed'); resolve(); });
+    _ably.connection.on('disconnected', ()=>{ _ablyReady=false; });
+    _ably.connection.on('connected', ()=>{ _ablyReady=true; });
   }catch(e){ console.warn('Ably setup error:', e); resolve(); }
+}
+
+// Entrer dans le canal de présence (appelé après login)
+async function _presenceEnter(){
+  if(!_ablyReady||!_currentUser) return;
+  try{
+    const ch = _ablyChannel('ecg:presence');
+    await ch.presence.update({
+      name: _currentUser.name,
+      color: _currentUser.color,
+      focused: _tabFocused
+    });
+  }catch(e){
+    try{ await _ablyChannel('ecg:presence').presence.enter({name:_currentUser.name,color:_currentUser.color,focused:_tabFocused}); }catch(e2){}
+  }
+}
+
+async function _presenceLeave(){
+  if(!_ablyReady) return;
+  try{ await _ablyChannel('ecg:presence').presence.leave(); }catch(e){}
+}
+
+function _onPresenceEvent(member){
+  if(member.action === 'leave' || member.action === 'absent'){
+    delete _presenceMembers[member.clientId];
+  } else {
+    if(member.data) _presenceMembers[member.clientId] = member.data;
+  }
+  updateOnlineCount();
+}
+
+// Mettre à jour focused dans la présence quand l'onglet change
+function _presenceUpdateFocus(){
+  if(!_ablyReady||!_currentUser) return;
+  try{
+    _ablyChannel('ecg:presence').presence.update({
+      name: _currentUser.name,
+      color: _currentUser.color,
+      focused: _tabFocused
+    });
+  }catch(e){}
 }
 
 function _onAblyUserUpdate(key, value){
@@ -2848,7 +2924,7 @@ function _onAblyUserUpdate(key, value){
     if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
     _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs = Date.now();
-    updateOnlineCount();
+    // Ne pas appeler updateOnlineCount ici — la présence Ably gère ça
   }catch(e){}
 }
 
@@ -2870,7 +2946,7 @@ function _onAblyChatUpdate(value){
   }catch(e){}
 }
 
-// Storage wrappers — maintenant backed par Ably + KV mémoire
+// Storage wrappers — Ably KV broadcast + cache mémoire
 async function storageSet(key, value, shared){
   _kv[key] = value;
   if(_ablyReady){
@@ -2898,13 +2974,12 @@ async function storageGet(key, shared){
 
 async function storageList(prefix, shared){
   const keys = Object.keys(_kv).filter(k=>k.startsWith(prefix));
-  // Also try to recover from Ably history if cache is empty
   if(!keys.length && _ablyReady){
     try{
       const ch = _ablyChannel('ecg:kv');
       const page = await ch.history({limit:200, direction:'backwards'});
       for(const msg of (page ? page.items : [])){
-        if(msg.name==='set' && msg.data && msg.data.key && !_kv[msg.data.key]){
+        if(msg.name==='set' && msg.data && msg.data.key && _kv[msg.data.key]===undefined){
           _kv[msg.data.key] = msg.data.value;
         }
       }
@@ -2929,13 +3004,15 @@ async function sbPushMyStats(extra={}){
     const dp=Math.max(prevData.duelsPlayed||0, extra.duelsPlayed||0);
     const userData={
       name:_currentUser.name,color:_currentUser.color,
+      pwHash:_currentUser.pwHash||prevData.pwHash||'',
       lastSeen:Date.now(),
       online:true,
-      focused:_tabFocused,   // ← clé : est-ce l'onglet actif ?
+      focused:_tabFocused,
       scores,
       streak:getStreak(),bestStreak:Math.max(_getStoredBestStreak(),prevData.bestStreak||0,_sessionBestStreak||0),
       mastered:mastCount(FICHES),totalFiches:FICHES.length,
       duelsWon:dw, duelsPlayed:dp,
+      mastery:MASTERY,  // sync multi-appareils
     };
     await storageSet(_currentUser.key,JSON.stringify(userData),true);
     if(!_sbUserIndexed){
@@ -2994,17 +3071,19 @@ function sbStartHeartbeat(){
   document.addEventListener('visibilitychange', ()=>{
     if(!document.hidden){
       _usersCacheTs = 0;
+      _presenceUpdateFocus();
       if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
       _runUnifiedPoll().then(()=>_scheduleNext());
     } else {
-      // Passe en arrière-plan : push immédiat avec focused=false
+      // Passe en arrière-plan : update présence immédiatement
+      _presenceUpdateFocus();
       sbPushMyStats();
     }
   });
 
-  // focus/blur window → repush immédiat (focused change)
-  window.addEventListener('focus', ()=>{ sbPushMyStats(); updateOnlineCount(); });
-  window.addEventListener('blur',  ()=>{ sbPushMyStats(); });
+  // focus/blur window → update présence Ably immédiatement (temps réel)
+  window.addEventListener('focus', ()=>{ _presenceUpdateFocus(); sbPushMyStats(); });
+  window.addEventListener('blur',  ()=>{ _presenceUpdateFocus(); sbPushMyStats(); });
 }
 
 // ─── Boucle unifiée ─────────────────────────────────────────────
@@ -3041,19 +3120,18 @@ async function _fetchAllUsers(force=false){
 }
 
 // ─── Mise à jour UI présence en ligne ───────────────────────────
-async function updateOnlineCount(){
-  if(!_ablyReady) return;
-  const users=await _fetchAllUsers(false);
-  const online=users.filter(u=>isOnline(u));
-  const onPage=online.filter(u=>isActivelyOnPage(u));
-  const n=online.length;
-  const nPage=onPage.length;
+function updateOnlineCount(){
+  // Source de vérité : Ably Presence (push natif, zéro polling)
+  const members = Object.values(_presenceMembers);
+  const onPage = members.filter(m=>m.focused===true);
+  const n = members.length;
+  const nPage = onPage.length;
 
-  // Topbar counter — affiche ceux ACTUELLEMENT sur la page
+  // Topbar counter
   const el=document.getElementById('tp-online-n');
   if(el) el.textContent=nPage>0?nPage:(n>0?n:'—');
 
-  // Dot : vert vif si quelqu'un est sur la page, vert pâle si juste en ligne, gris sinon
+  // Dot
   const dot=document.getElementById('tp-online-dot');
   if(dot){
     if(nPage>0){
@@ -3071,7 +3149,7 @@ async function updateOnlineCount(){
     }
   }
 
-  // Tooltip avatars — deux sections : sur cette page / ailleurs
+  // Tooltip avatars
   const avatarsEl=document.getElementById('tp-online-avatars');
   if(avatarsEl){
     if(n===0){
@@ -3079,62 +3157,56 @@ async function updateOnlineCount(){
     } else {
       let html='';
       if(onPage.length){
-        html+=`<div style="font-family:var(--ff-mono);font-size:7px;letter-spacing:1px;text-transform:uppercase;color:#2ecc71;margin-bottom:4px">Sur cette page</div>`;
-        html+=onPage.slice(0,6).map(u=>`
-          <div style="display:flex;align-items:center;gap:7px;margin-bottom:3px">
-            <div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--t4)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff;flex-shrink:0">${u.name[0].toUpperCase()}</div>
-            <span style="font-family:var(--ff-mono);font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px">${u.name}</span>
-            <span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;flex-shrink:0;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span>
-          </div>`).join('');
+        html+='<div style="font-family:var(--ff-mono);font-size:7px;letter-spacing:1px;text-transform:uppercase;color:#2ecc71;margin-bottom:4px">Sur cette page</div>';
+        html+=onPage.slice(0,6).map(u=>`<div style="display:flex;align-items:center;gap:7px;margin-bottom:3px"><div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff;flex-shrink:0">${(u.name||'?')[0].toUpperCase()}</div><span style="font-family:var(--ff-mono);font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px">${u.name}</span><span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;flex-shrink:0;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span></div>`).join('');
       }
-      const offPage=online.filter(u=>!isActivelyOnPage(u));
+      const offPage=members.filter(m=>!m.focused);
       if(offPage.length){
         html+=`<div style="font-family:var(--ff-mono);font-size:7px;letter-spacing:1px;text-transform:uppercase;color:#f39c12;margin-top:${onPage.length?'8px':'0'};margin-bottom:4px">Autre onglet</div>`;
-        html+=offPage.slice(0,4).map(u=>`
-          <div style="display:flex;align-items:center;gap:7px;margin-bottom:3px">
-            <div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--t4)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff;flex-shrink:0;opacity:.7">${u.name[0].toUpperCase()}</div>
-            <span style="font-family:var(--ff-mono);font-size:9px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px">${u.name}</span>
-            <span style="width:6px;height:6px;background:#f39c12;border-radius:50%;flex-shrink:0;margin-left:auto;opacity:.7"></span>
-          </div>`).join('');
+        html+=offPage.slice(0,4).map(u=>`<div style="display:flex;align-items:center;gap:7px;margin-bottom:3px"><div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff;flex-shrink:0;opacity:.7">${(u.name||'?')[0].toUpperCase()}</div><span style="font-family:var(--ff-mono);font-size:9px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px">${u.name}</span><span style="width:6px;height:6px;background:#f39c12;border-radius:50%;flex-shrink:0;margin-left:auto;opacity:.7"></span></div>`).join('');
       }
       avatarsEl.innerHTML=html+(n>10?`<div style="font-family:var(--ff-mono);font-size:8px;color:var(--t4);margin-top:2px">+${n-10} autres</div>`:'');
     }
   }
 
-  // Label topbar dynamique
+  // Label topbar
   const lbl=document.getElementById('tp-online-label');
-  if(lbl) lbl.textContent = nPage>0 ? ' sur la page' : (n>0 ? ' en ligne' : ' en ligne');
+  if(lbl) lbl.textContent = nPage>0 ? ' sur la page' : ' en ligne';
 
-  // Scoreboard page counter
+  // Scoreboard counter
   const sbEl=document.getElementById('sb-online-count');
   if(sbEl){
-    if(nPage>0 && nPage<n) sbEl.textContent=nPage+' sur la page, '+n+' en ligne';
+    if(nPage>0 && nPage<n) sbEl.textContent=nPage+' sur la page · '+n+' en ligne';
     else if(n>0) sbEl.textContent=n+' utilisateur'+(n>1?'s':'')+' en ligne';
     else sbEl.textContent='Aucun utilisateur en ligne';
   }
 
-  // Pied de sidebar
+  // Sidebar footer
   const sbFoot=document.getElementById('sb-online-foot');
-  if(sbFoot){
-    sbFoot.textContent=n>0?n+' en ligne':'hors ligne';
-    sbFoot.style.color=n>0?'#2ecc71':'var(--t4)';
-  }
+  if(sbFoot){ sbFoot.textContent=n>0?n+' en ligne':'hors ligne'; sbFoot.style.color=n>0?'#2ecc71':'var(--t4)'; }
 
-  // Mise à jour badges scoreboard (si ouvert) — sans re-render complet
+  // Badges scoreboard inline
   const sbContent=document.getElementById('sb-user-list');
   if(sbContent && sbContent.children.length>0){
-    users.forEach(u=>{
+    const nameSet = new Set(members.map(m=>m.name));
+    const onPageNames = new Set(onPage.map(m=>m.name));
+    _usersCache.forEach(u=>{
       const row=document.getElementById('sb-row-'+u.name);
       if(!row) return;
       const badge=row.querySelector('.sb-online-badge');
       const ring=row.querySelector('.sb-avatar-ring');
-      const nowOnline=isOnline(u);
-      if(badge) badge.innerHTML=onlineStatusHtml(u);
-      if(ring) ring.style.boxShadow=nowOnline?'0 0 0 2px var(--s1),0 0 0 3.5px #2ecc71':'none';
+      const nowOnline=nameSet.has(u.name);
+      const nowOnPage=onPageNames.has(u.name);
+      if(badge){
+        if(nowOnPage) badge.innerHTML='<span style="font-family:var(--ff-mono);font-size:7px;color:#2ecc71">● SUR LA PAGE</span>';
+        else if(nowOnline) badge.innerHTML='<span style="font-family:var(--ff-mono);font-size:7px;color:#f39c12">◑ EN LIGNE</span>';
+        else badge.innerHTML=u.lastSeen?`<span style="font-family:var(--ff-mono);font-size:7px;color:var(--t4)">○ ${timeAgo(u.lastSeen)}</span>`:'';
+      }
+      if(ring) ring.style.boxShadow=nowOnPage?'0 0 0 2px var(--s1),0 0 0 3.5px #2ecc71':nowOnline?'0 0 0 2px var(--s1),0 0 0 3.5px #f39c12':'none';
     });
   }
 
-  // Pill du chat
+  // Pill chat
   const pill=document.getElementById('chat-online-pill');
   if(pill){ pill.textContent=n>0?n+' en ligne':'hors ligne'; pill.style.color=n>0?'#2ecc71':'var(--t4)'; }
 }
@@ -3152,33 +3224,83 @@ function updateSbUI(){
   if(loginBtn) loginBtn.textContent=_currentUser?'👤 '+_currentUser.name:'🔑 Connexion';
 }
 
-async function sbLogin(name){
+async function sbLogin(name, password=''){
   if(!name||!name.trim()) return;
   name=name.trim().slice(0,20);
   const key=sbUserKey(name);
-  let color;
+
+  // Hash du mot de passe (SHA-256) — si déjà hashé (auto-login), utiliser directement
+  let pwHash = '';
+  if(password){
+    if(password.startsWith('__hash__')){
+      pwHash = password.slice(8); // déjà hashé, stocké localement
+    } else {
+      pwHash = await _hashPassword(password);
+    }
+  }
+
+  // Vérifier si le compte existe déjà avec un mot de passe
+  let color, existingPwHash='', existingData={};
   try{
     const res=await storageGet(key,true);
-    if(res){ const d=JSON.parse(res.value); color=d.color; }
+    if(res){
+      existingData=JSON.parse(res.value);
+      color=existingData.color;
+      existingPwHash=existingData.pwHash||'';
+    }
   }catch(e){}
+
+  // Vérification mot de passe si compte protégé
+  if(existingPwHash && pwHash !== existingPwHash){
+    _showLoginError('Mot de passe incorrect.');
+    return false;
+  }
+
   if(!color){
     const colorIdx=Math.abs(name.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%USER_COLORS.length;
     color=USER_COLORS[colorIdx];
   }
-  _currentUser={name,color,key};
+
+  _currentUser={name,color,key,pwHash};
   localStorage.setItem('ecg_math_username',name);
+  if(pwHash) localStorage.setItem('ecg_math_pwhash',pwHash);
+
+  // Sync des données depuis le cloud si compte existant
+  if(existingData.mastery){
+    try{
+      const cloudMastery=existingData.mastery;
+      // Merge : prend le meilleur score par fiche
+      Object.keys(cloudMastery).forEach(fid=>{
+        const local=MASTERY[fid]||{pts:0};
+        const cloud=cloudMastery[fid];
+        if((cloud.pts||0)>(local.pts||0)) MASTERY[fid]=cloud;
+      });
+      saveMastery(); updateUI();
+    }catch(e){}
+  }
+
   _sbUserIndexed=false;
   await sbPushMyStats();
   sbStartHeartbeat();
+  // Entrer dans la présence Ably
+  await _presenceEnter();
   updateSbUI();
   document.getElementById('sb-login-modal')?.remove();
   if(_currentView==='scoreboard') go('scoreboard');
+  return true;
 }
 
-function sbLogout(){
+function _showLoginError(msg){
+  const err=document.getElementById('sb-login-error');
+  if(err){ err.textContent=msg; err.style.display='block'; }
+}
+
+async function sbLogout(){
+  await _presenceLeave();
   sbSetOffline();
   _currentUser=null;
   localStorage.removeItem('ecg_math_username');
+  localStorage.removeItem('ecg_math_pwhash');
   _sbUserIndexed=false;
   updateSbUI();
   if(_currentView==='scoreboard') go('scoreboard');
@@ -3190,22 +3312,41 @@ function showLoginModal(){
   const modal=document.createElement('div');
   modal.id='sb-login-modal';
   modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:1000';
-  modal.innerHTML=`<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:32px 36px;width:320px;box-shadow:var(--sh)">
-    <div style="font-family:var(--ff-ser);font-size:22px;font-weight:600;margin-bottom:6px">Rejoindre le classement</div>
-    <div style="font-family:var(--ff-mono);font-size:10px;color:var(--t4);margin-bottom:20px;line-height:1.6">Choisis un pseudo pour apparaître dans le scoreboard partagé.</div>
-    <input id="sb-name-input" type="text" maxlength="20" placeholder="Ton pseudo…"
-      style="width:100%;padding:10px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--fg);font-size:14px;font-family:var(--ff-sans);outline:none;box-sizing:border-box"
-      onkeydown="if(event.key==='Enter') sbLoginFromModal()">
-    <div style="color:var(--t4);font-family:var(--ff-mono);font-size:9px;margin-top:8px;margin-bottom:20px">Visible de tous · Max 20 caractères</div>
-    <div style="display:flex;gap:8px">
-      <button onclick="sbLoginFromModal()" style="flex:1;padding:10px;background:var(--navy);color:#fff;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:500">Rejoindre</button>
+  modal.innerHTML=`<div style="background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:32px 36px;width:340px;box-shadow:var(--sh)">
+    <div style="font-family:var(--ff-ser);font-size:22px;font-weight:600;margin-bottom:4px">Connexion</div>
+    <div style="font-family:var(--ff-mono);font-size:10px;color:var(--t4);margin-bottom:20px;line-height:1.6">Pseudo + mot de passe pour sync entre appareils.<br>Nouveau compte = crée directement en remplissant les deux champs.</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <input id="sb-name-input" type="text" maxlength="20" placeholder="Pseudo…"
+        style="width:100%;padding:10px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--fg);font-size:14px;font-family:var(--ff-sans);outline:none;box-sizing:border-box"
+        onkeydown="if(event.key==='Enter') document.getElementById('sb-pw-input').focus()">
+      <div style="position:relative">
+        <input id="sb-pw-input" type="password" maxlength="64" placeholder="Mot de passe (optionnel)…"
+          style="width:100%;padding:10px 40px 10px 14px;background:var(--s2);border:1px solid var(--bd);border-radius:8px;color:var(--fg);font-size:14px;font-family:var(--ff-sans);outline:none;box-sizing:border-box"
+          onkeydown="if(event.key==='Enter') sbLoginFromModal()">
+        <button onclick="const i=document.getElementById('sb-pw-input');i.type=i.type==='password'?'text':'password'" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px">👁</button>
+      </div>
+      <div id="sb-login-error" style="display:none;font-family:var(--ff-mono);font-size:10px;color:var(--red);padding:6px 10px;background:var(--redbg);border-radius:5px;border:1px solid rgba(209,82,72,.2)"></div>
+      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4);line-height:1.6">Pseudo visible de tous · Sans mot de passe = accès depuis n'importe où</div>
+      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--orange);padding:6px 10px;background:var(--orangebg);border-radius:5px;border:1px solid rgba(208,128,64,.2);line-height:1.6">⚠️ N'utilise pas un mot de passe personnel — choisis un code simple dédié à ce site (ex: maths2026)</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:18px">
+      <button onclick="sbLoginFromModal()" style="flex:1;padding:10px;background:var(--navy);color:#fff;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:500" id="sb-login-submit-btn">Connexion</button>
       <button onclick="document.getElementById('sb-login-modal').remove()" style="padding:10px 16px;background:var(--s2);color:var(--t3);border:1px solid var(--bd);border-radius:8px;font-size:13px;cursor:pointer">Annuler</button>
     </div>
   </div>`;
   document.body.appendChild(modal);
   setTimeout(()=>document.getElementById('sb-name-input')?.focus(),50);
 }
-function sbLoginFromModal(){ const name=document.getElementById('sb-name-input')?.value; if(name?.trim()) sbLogin(name); }
+
+async function sbLoginFromModal(){
+  const name=document.getElementById('sb-name-input')?.value;
+  const pw=document.getElementById('sb-pw-input')?.value||'';
+  const btn=document.getElementById('sb-login-submit-btn');
+  if(!name?.trim()) return;
+  if(btn){ btn.disabled=true; btn.textContent='Connexion…'; }
+  const ok = await sbLogin(name, pw);
+  if(!ok && btn){ btn.disabled=false; btn.textContent='Connexion'; }
+}
 
 async function initUser(){
   // Init Ably — tout le mode en ligne depend de ca
@@ -3223,11 +3364,12 @@ async function initUser(){
     }catch(e){}
   }
   const saved=localStorage.getItem('ecg_math_username');
+  const savedPw=localStorage.getItem('ecg_math_pwhash')||'';
   if(saved){
-    if(_ablyReady){ await sbLogin(saved); }
+    if(_ablyReady){ await sbLogin(saved, savedPw ? '__hash__'+savedPw : ''); }
     else{
       const colorIdx=Math.abs(saved.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0))%USER_COLORS.length;
-      _currentUser={name:saved,color:USER_COLORS[colorIdx],key:sbUserKey(saved)};
+      _currentUser={name:saved,color:USER_COLORS[colorIdx],key:sbUserKey(saved),pwHash:savedPw};
       updateSbUI();
     }
   }

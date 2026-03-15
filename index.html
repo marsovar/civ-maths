@@ -2538,16 +2538,27 @@ async function renderScoreboard(container){
   </div>`;
 
   const sbContent=document.getElementById('sb-content');
-  if(!_ablyReady){ if(sbContent) sbContent.innerHTML=`<div style="text-align:center;padding:32px 20px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--r)"><div style="font-size:24px;margin-bottom:12px">⚠️</div><div style="font-family:var(--ff-mono);font-size:10px;color:var(--t3);line-height:2">Connexion au serveur en cours...</div></div>`; return; }
-  if(_usersCache.length) sbRenderList(sbContent,_usersCache);
-  _fetchAllUsers(true).then(users=>{ const el=document.getElementById('sb-content'); if(el) sbRenderList(el,users); });
+  if(!_ablyReady){
+    // Ably pas encore prêt — réessayer dans 2s
+    if(sbContent) sbContent.innerHTML=`<div style="text-align:center;padding:32px;color:var(--t4);font-family:var(--ff-mono);font-size:11px">Connexion en cours…</div>`;
+    setTimeout(()=>{ if(_currentView==='scoreboard'&&_ablyReady){ const c=document.getElementById('sb-content'); if(c) _fetchAllUsers(true).then(u=>sbRenderList(c,u)); } }, 2000);
+    return;
+  }
+  // Afficher cache immédiatement si dispo
+  if(_usersCache.length) sbRenderList(sbContent, _usersCache);
+  // Puis rafraîchir depuis Ably
+  _fetchAllUsers(true).then(users=>{
+    const el=document.getElementById('sb-content');
+    if(el) sbRenderList(el, users);
+  });
+  updateOnlineCount();
 }
 
 function sbRenderList(container,users){
   if(!users.length){ container.innerHTML=`<div style="text-align:center;padding:40px;color:var(--t4);font-family:var(--ff-mono);font-size:11px">Aucun joueur. Connecte-toi !</div>`; return; }
   const medals=['🥇','🥈','🥉'];
   // SOURCE UNIQUE : Ably Presence — même source que updateOnlineCount et onlineStatusHtml
-  const _presenceNames = new Set(Object.values(_presenceMembers).map(m=>m.name));
+  const _presenceNames = _getPresenceNames(); // SOURCE UNIQUE
   let html='<div style="display:flex;flex-direction:column;gap:6px">';
   users.forEach((u,i)=>{
     const isMe=_currentUser&&u.name===_currentUser.name;
@@ -2730,73 +2741,77 @@ function _timeAgo(ts){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ONLINE — USER SYSTEM v30
-//  Architecture :
-//  • Ably Presence  → compteur en ligne INSTANTANÉ (push natif, <100ms)
-//  • Ably KV canal  → scores, chat, duels (broadcast temps réel)
-//  • Duel via canal dédié Ably → invitation + accept en push, pas de polling
-//  • Login obligatoire pour scoreboard + présence
-//  • Déconnexion → disparaît immédiatement du scoreboard
+//  ONLINE v32 — Architecture propre et fiable
+//
+//  PRÉSENCE  : Ably Presence natif avec clientId STABLE (= nom user)
+//              → pas de fantôme, une seule entrée par user
+//  CHAT      : Canal Ably dédié "ecg:chat" en pub/sub pur
+//              → pas de read-modify-write, pas de perte de message
+//  SCORES    : Canal "ecg:kv" pour les stats (inchangé)
+//  SOURCE UNIQUE pour TOUS les indicateurs → _presenceMembers
 // ══════════════════════════════════════════════════════════════════
-let _currentUser = null;
+
+let _currentUser   = null;
 let _onlineHeartbeat = null;
-let _ablyReady = false;
-let _ably = null;
-let _ablyChannels = {};
-let _kv = {};
-let _presenceMembers = {}; // clientId -> {name, color}
+let _ablyReady     = false;
+let _ably          = null;
+let _ablyChannels  = {};
+let _kv            = {};
+// clientId stable → data de présence
+// On utilise le NOM comme clientId pour éviter les doublons fantômes
+let _presenceMembers = {}; // name -> {name, color, ts}
 let _usersCache = [], _usersCacheTs = 0;
 let _sbPushInProgress = false, _sbUserIndexed = false;
 let _duelState = null;
 
-const ONLINE_TTL = 15000;
-const POLL_INTERVAL_ACTIVE = 6000;
-const POLL_INTERVAL_NORMAL = 12000;
-const POLL_INTERVAL_BG = 45000;
-const USERS_CACHE_TTL_ACTIVE = 4000;
-const USERS_CACHE_TTL_NORMAL = 10000;
-const USERS_CACHE_TTL_BG = 45000;
+const POLL_INTERVAL_ACTIVE = 8000;
+const POLL_INTERVAL_NORMAL = 15000;
+const POLL_INTERVAL_BG     = 60000;
+const USERS_CACHE_TTL      = 30000;
 const USER_COLORS = ['#2a7a8f','#2d7a5f','#c0392b','#6b4fa8','#b8922a','#1a6a9a','#7a4a9f','#1a8a62','#9a6a28'];
 const ABLY_KEY = 'omrAsg.61E1oQ:sJXWtnTzOlCdLP2t44fhmBB1RyMPURSJQJLNOPwccR8';
 
-// ─── Tab focus tracking ──────────────────────────────────────────
-let _tabFocused = !document.hidden;
-document.addEventListener('visibilitychange', () => { _tabFocused = !document.hidden; });
-window.addEventListener('focus', () => { _tabFocused = true; });
-window.addEventListener('blur', () => { _tabFocused = false; });
-
 // ─── Helpers ────────────────────────────────────────────────────
 function sbUserKey(name){ return 'ecg_math_users:'+name.toLowerCase().replace(/[^a-z0-9]/g,'_'); }
-function isOnline(u){ return u && u.online && (Date.now()-u.lastSeen) < ONLINE_TTL; }
 function timeAgo(ts){
   if(!ts) return '';
   const d = Date.now()-ts;
-  if(d<60000) return 'à l\'instant';
-  if(d<3600000) return 'il y a '+Math.floor(d/60000)+' min';
+  if(d<60000)    return "à l'instant";
+  if(d<3600000)  return 'il y a '+Math.floor(d/60000)+' min';
   if(d<86400000) return 'il y a '+Math.floor(d/3600000)+'h';
   return 'il y a '+Math.floor(d/86400000)+'j';
 }
-function hexToRgb(hex){ try{ return parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16); }catch(e){ return '100,100,100'; } }
-function _getPresenceNames(){ return new Set(Object.values(_presenceMembers).map(m=>m.name)); }
+function hexToRgb(hex){
+  try{ return parseInt(hex.slice(1,3),16)+','+parseInt(hex.slice(3,5),16)+','+parseInt(hex.slice(5,7),16); }
+  catch(e){ return '100,100,100'; }
+}
+// SOURCE UNIQUE : présence basée sur _presenceMembers (Ably Presence)
+function isUserOnline(name){ return !!_presenceMembers[name]; }
+function _getPresenceNames(){ return new Set(Object.keys(_presenceMembers)); }
+// isOnline(u) — legacy compat, basé sur présence Ably maintenant
+function isOnline(u){ return u && isUserOnline(u.name); }
 function onlineStatusHtml(u){
-  // SOURCE UNIQUE : même _presenceMembers que updateOnlineCount et sbRenderList
-  if(_getPresenceNames().has(u.name)) return '<span style="font-family:var(--ff-mono);font-size:7px;color:#2ecc71">● EN LIGNE</span>';
+  if(isUserOnline(u.name)) return '<span style="font-family:var(--ff-mono);font-size:7px;color:#2ecc71">● EN LIGNE</span>';
   if(u.lastSeen) return '<span style="font-family:var(--ff-mono);font-size:7px;color:var(--t4)">○ '+timeAgo(u.lastSeen)+'</span>';
   return '';
 }
 
-// ─── SHA-256 password hash ───────────────────────────────────────
+// ─── SHA-256 ─────────────────────────────────────────────────────
 async function _hashPassword(pw){
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw));
   return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('').slice(0,32);
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  ABLY — init + canaux
+//  ABLY INIT
 // ══════════════════════════════════════════════════════════════════
 function _ablyChannel(name){
   if(!_ably) return null;
-  if(!_ablyChannels[name]) _ablyChannels[name] = _ably.channels.get(name);
+  if(!_ablyChannels[name]){
+    // Canal KV avec rewind 2h → récupère les derniers messages même après reconnexion
+    const opts = name === 'ecg:kv' ? {params: {rewind: '2h'}} : {};
+    _ablyChannels[name] = _ably.channels.get(name, opts);
+  }
   return _ablyChannels[name];
 }
 
@@ -2805,139 +2820,151 @@ async function ablyInit(){
     if(typeof Ably !== 'undefined'){ _setupAbly(resolve); return; }
     const s = document.createElement('script');
     s.src = 'https://cdn.ably.com/lib/ably.min-2.js';
-    s.onload = () => _setupAbly(resolve);
-    s.onerror = () => { console.warn('Ably load failed'); resolve(); };
+    s.onload  = () => _setupAbly(resolve);
+    s.onerror = () => { console.warn('[Ably] script load failed'); resolve(); };
     document.head.appendChild(s);
   });
 }
 
 function _setupAbly(resolve){
   try{
-    _ably = new Ably.Realtime({ key: ABLY_KEY, clientId: 'ecg-'+Math.random().toString(36).slice(2) });
+    // clientId = nom utilisateur = STABLE → une seule entrée de présence par user
+    // On utilisera un clientId générique au départ, puis on entrera avec le nom au login
+    _ably = new Ably.Realtime({
+      key: ABLY_KEY,
+      clientId: 'anon-' + Math.random().toString(36).slice(2,8)
+    });
+
     _ably.connection.on('connected', async () => {
       _ablyReady = true;
+      console.log('[Ably] connected');
 
-      // Canal KV — scores, chat, duels
+      // ── Canal KV : scores, duels ─────────────────────────────
       const kvCh = _ablyChannel('ecg:kv');
       kvCh.subscribe('set', msg => {
         const {key, value} = msg.data;
         _kv[key] = value;
-        if(key.startsWith('ecg_math_users:') && key !== 'ecg_math_users:index') _onAblyUserUpdate(value);
-        if(key === 'ecg_math_chat:messages') _onAblyChatUpdate(value);
+        if(key.startsWith('ecg_math_users:') && key !== 'ecg_math_users:index'){
+          _onAblyUserUpdate(value);
+        }
       });
 
-      // Canal Présence — qui est EN LIGNE (temps réel natif)
+      // ── Canal Chat : pub/sub pur, plus de KV pour le chat ───
+      const chatCh = _ablyChannel('ecg:chat');
+      chatCh.subscribe('msg', msg => {
+        const m = msg.data;
+        if(!m || !m.ts || !m.author) return;
+        const now = Date.now();
+        // Déduplique par ts+author
+        const exists = _chatMsgs.some(x => x.ts===m.ts && x.author===m.author);
+        if(!exists){
+          _chatMsgs.push(m);
+          // Garder seulement les messages < CHAT_TTL
+          _chatMsgs = _chatMsgs.filter(x => (now - x.ts) < CHAT_TTL).slice(-CHAT_MAX);
+          _chatMsgs.sort((a,b) => a.ts - b.ts);
+          if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
+          else{
+            const me = _currentUser?.name;
+            if(m.author !== me && m.ts > _chatLastSeen){
+              _chatUnread++;
+              _chatRefreshBadge();
+            }
+          }
+        }
+      });
+      // Charger l'historique du chat au démarrage (72h Ably)
+      _loadChatHistory();
+
+      // ── Canal Présence : qui est vraiment sur le site ────────
       const presenceCh = _ablyChannel('ecg:presence');
       presenceCh.presence.subscribe(member => _onPresenceEvent(member));
       try{
-        const members = await presenceCh.presence.get();
+        const existing = await presenceCh.presence.get();
         _presenceMembers = {};
-        members.forEach(m => { if(m.data) _presenceMembers[m.clientId] = m.data; });
+        existing.forEach(m => {
+          if(m.data && m.data.name){
+            _presenceMembers[m.data.name] = m.data;
+          }
+        });
         updateOnlineCount();
       }catch(e){}
 
-      // Canal Duels — invitations temps réel
+      // ── Canal Duels ──────────────────────────────────────────
       const duelCh = _ablyChannel('ecg:duels');
       duelCh.subscribe('invite', msg => {
         if(!_currentUser) return;
-        const inv = msg.data;
-        if(inv.to === _currentUser.name && !_duelState){
-          _showDuelNotifBanner(inv.from);
-        }
+        if(msg.data.to === _currentUser.name && !_duelState)
+          _showDuelNotifBanner(msg.data.from);
       });
       duelCh.subscribe('accept', msg => {
         if(!_currentUser) return;
-        const acc = msg.data;
-        // L'initiateur reçoit l'acceptation → lancer le duel
-        if(acc.from === _currentUser.name && acc.to && !_duelState){
-          _startDuel(acc.to);
-        }
+        if(msg.data.from === _currentUser.name && msg.data.to && !_duelState)
+          _startDuel(msg.data.to);
       });
-      // Canal résultats duel — pour notifier l'adversaire en temps réel
       duelCh.subscribe('result', msg => {
         if(!_currentUser || !_duelState) return;
-        const res = msg.data;
-        // Si ce résultat concerne notre duel en cours (page finale)
-        if(res.player !== _currentUser.name){
-          _onOpponentDuelResult(res);
-        }
+        if(msg.data.player !== _currentUser.name)
+          _onOpponentDuelResult(msg.data);
       });
 
       resolve();
     });
-    _ably.connection.on('failed', () => { console.warn('Ably failed'); resolve(); });
+
     _ably.connection.on('disconnected', () => { _ablyReady = false; });
-    _ably.connection.on('connected', () => { _ablyReady = true; });
-  }catch(e){ console.warn('Ably setup error:', e); resolve(); }
+    _ably.connection.on('failed',       () => { console.warn('[Ably] connection failed'); resolve(); });
+    // Reconnexion automatique : Ably gère ça nativement
+    _ably.connection.on('connected',    () => { _ablyReady = true; });
+
+  }catch(e){ console.warn('[Ably] setup error:', e); resolve(); }
 }
 
-// ─── Présence ───────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  PRÉSENCE — basée sur le NOM (pas clientId aléatoire)
+// ══════════════════════════════════════════════════════════════════
 async function _presenceEnter(){
   if(!_ablyReady || !_currentUser) return;
   try{
     const ch = _ablyChannel('ecg:presence');
-    const data = {name: _currentUser.name, color: _currentUser.color};
-    try{ await ch.presence.update(data); }catch(e){ await ch.presence.enter(data); }
+    const data = { name: _currentUser.name, color: _currentUser.color, ts: Date.now() };
+    // enter() — si déjà entré ça lève une erreur qu'on ignore
+    try{ await ch.presence.enter(data); }
+    catch(e){
+      // Déjà entré → update
+      try{ await ch.presence.update(data); }catch(e2){}
+    }
   }catch(e){}
 }
 
 async function _presenceLeave(){
   if(!_ablyReady) return;
   try{ await _ablyChannel('ecg:presence').presence.leave(); }catch(e){}
-}
-
-function _presenceUpdateFocus(){
-  if(!_ablyReady || !_currentUser) return;
-  try{
-    _ablyChannel('ecg:presence').presence.update({
-      name: _currentUser.name, color: _currentUser.color
-    });
-  }catch(e){}
+  // Supprimer localement immédiatement
+  if(_currentUser) delete _presenceMembers[_currentUser.name];
+  updateOnlineCount();
 }
 
 function _onPresenceEvent(member){
+  if(!member.data || !member.data.name) return;
+  const name = member.data.name;
   if(member.action === 'leave' || member.action === 'absent'){
-    delete _presenceMembers[member.clientId];
+    delete _presenceMembers[name];
   } else {
-    if(member.data) _presenceMembers[member.clientId] = member.data;
+    // enter / update / present
+    _presenceMembers[name] = member.data;
   }
   updateOnlineCount();
 }
 
-// ─── KV callbacks ───────────────────────────────────────────────
-function _onAblyUserUpdate(value){
-  try{
-    const u = JSON.parse(value);
-    const idx = _usersCache.findIndex(x=>x.name===u.name);
-    if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
-    _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
-    _usersCacheTs = Date.now();
-    // Mettre à jour le scoreboard si ouvert, sans re-render complet
-    _patchScoreboardRow(u);
-  }catch(e){}
-}
-
-function _onAblyChatUpdate(value){
-  try{
-    const msgs = JSON.parse(value);
-    const now = Date.now();
-    const fresh = msgs.filter(m=>(now-m.ts)<CHAT_TTL);
-    const changed = fresh.length!==_chatMsgs.length||(fresh.length>0&&_chatMsgs.length>0&&fresh[fresh.length-1].ts!==_chatMsgs[_chatMsgs.length-1].ts);
-    _chatMsgs = fresh;
-    if(changed){
-      if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
-      else{
-        const me = _currentUser?.name;
-        const newMsgs = fresh.filter(m=>m.ts>_chatLastSeen&&m.author!==me);
-        if(newMsgs.length>0){ _chatUnread=newMsgs.length; _chatRefreshBadge(); }
-      }
-    }
-  }catch(e){}
-}
-
-// ─── Storage wrappers ───────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  STORAGE — KV Ably (scores, index users, duels)
+// ══════════════════════════════════════════════════════════════════
 async function storageSet(key, value, shared){
   _kv[key] = value;
+  // Persister localement les clés critiques (index + données users)
+  // → fallback si Ably history expire (plan gratuit = 2min sans rewind)
+  if(key === 'ecg_math_users:index' || key.startsWith('ecg_math_users:')){
+    try{ localStorage.setItem('_ably_kv_' + key, value); }catch(e){}
+  }
   if(_ablyReady){
     try{ await _ablyChannel('ecg:kv').publish('set', {key, value}); }catch(e){}
   }
@@ -2945,112 +2972,109 @@ async function storageSet(key, value, shared){
 }
 
 async function storageGet(key, shared){
+  // 1. Cache mémoire (le plus rapide)
   if(_kv[key] !== undefined) return {key, value: _kv[key]};
+  // 2. localStorage (fallback si Ably history expiré)
+  try{
+    const ls = localStorage.getItem('_ably_kv_' + key);
+    if(ls){ _kv[key] = ls; return {key, value: ls}; }
+  }catch(e){}
+  // 3. Ably history paginée (72h avec rewind)
   if(_ablyReady){
     try{
-      const page = await _ablyChannel('ecg:kv').history({limit:200, direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set' && msg.data?.key===key){
-          _kv[key] = msg.data.value;
-          return {key, value: msg.data.value};
+      let page = await _ablyChannel('ecg:kv').history({limit:1000, direction:'backwards'});
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set' && msg.data?.key===key){
+            _kv[key] = msg.data.value;
+            return {key, value: msg.data.value};
+          }
         }
-      }
+        if(page?.hasNext()) page = await page.next();
+        else break;
+      }while(page);
     }catch(e){}
   }
   return null;
 }
 
-async function storageList(prefix, shared){
-  const keys = Object.keys(_kv).filter(k=>k.startsWith(prefix));
-  if(!keys.length && _ablyReady){
-    try{
-      const page = await _ablyChannel('ecg:kv').history({limit:200, direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set' && msg.data?.key && _kv[msg.data.key]===undefined){
-          _kv[msg.data.key] = msg.data.value;
+// Bootstrap KV depuis localStorage au démarrage
+function _bootstrapKVFromLocalStorage(){
+  try{
+    for(let i=0; i<localStorage.length; i++){
+      const k = localStorage.key(i);
+      if(k && k.startsWith('_ably_kv_')){
+        const realKey = k.slice(9); // enlever '_ably_kv_'
+        if(_kv[realKey] === undefined){
+          _kv[realKey] = localStorage.getItem(k);
         }
       }
+    }
+  }catch(e){}
+}
+
+async function storageList(prefix, shared){
+  // Toujours récupérer depuis l'historique Ably pour avoir les données fraîches
+  if(_ablyReady){
+    try{
+      // Paginer si besoin — jusqu'à 1000 messages
+      let page = await _ablyChannel('ecg:kv').history({limit:1000, direction:'backwards'});
+      const seenKeys = new Set();
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set' && msg.data?.key){
+            const k = msg.data.key;
+            // Ne prendre que le message le plus récent par clé (direction backwards = plus récent en premier)
+            if(!seenKeys.has(k)){
+              seenKeys.add(k);
+              _kv[k] = msg.data.value;
+            }
+          }
+        }
+        if(page?.hasNext()) page = await page.next();
+        else break;
+      }while(page);
     }catch(e){}
-    return {keys: Object.keys(_kv).filter(k=>k.startsWith(prefix))};
   }
-  return {keys};
+  return {keys: Object.keys(_kv).filter(k=>k.startsWith(prefix))};
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  HEARTBEAT (sync stats + présence)
+//  HEARTBEAT — push stats uniquement, présence gérée par Ably
 // ══════════════════════════════════════════════════════════════════
 function _getAdaptiveInterval(){
   if(document.hidden) return POLL_INTERVAL_BG;
-  if(_chatOpen) return POLL_INTERVAL_ACTIVE;
+  if(_chatOpen)       return POLL_INTERVAL_ACTIVE;
   if(document.getElementById('sb-user-list')?.children.length>0) return POLL_INTERVAL_ACTIVE;
   return POLL_INTERVAL_NORMAL;
-}
-function _getUsersCacheTTL(){
-  if(document.hidden) return USERS_CACHE_TTL_BG;
-  if(_chatOpen) return USERS_CACHE_TTL_ACTIVE;
-  if(document.getElementById('sb-user-list')?.children.length>0) return USERS_CACHE_TTL_ACTIVE;
-  return USERS_CACHE_TTL_NORMAL;
 }
 
 function sbStartHeartbeat(){
   if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
-  _runUnifiedPoll();
+
+  // Push immédiat
+  sbPushMyStats();
+
   function _scheduleNext(){
     _onlineHeartbeat = setTimeout(async () => {
-      await _runUnifiedPoll();
+      if(_currentUser && _ablyReady) await sbPushMyStats();
+      await _checkDuelInvitePoll();
       _scheduleNext();
     }, _getAdaptiveInterval());
   }
   _scheduleNext();
 
-  // beforeunload : quitter la présence Ably mais NE PAS marquer offline dans KV
-  // → le scoreboard reste permanent jusqu'à sbLogout explicite
-  window.addEventListener('beforeunload', () => { _presenceLeave(); });
-
-  document.addEventListener('visibilitychange', () => {
-    _tabFocused = !document.hidden;
-    _presenceUpdateFocus();
-    if(!document.hidden){
-      _usersCacheTs = 0;
-      if(_onlineHeartbeat) clearTimeout(_onlineHeartbeat);
-      _runUnifiedPoll().then(() => _scheduleNext());
-    } else {
-      sbPushMyStats();
-    }
+  // beforeunload — quitter la présence proprement
+  window.addEventListener('beforeunload', () => {
+    if(_currentUser) _presenceLeave();
   });
 
-  window.addEventListener('focus', () => { _tabFocused=true; _presenceUpdateFocus(); sbPushMyStats(); });
-  window.addEventListener('blur',  () => { _tabFocused=false; _presenceUpdateFocus(); sbPushMyStats(); });
-}
-
-let _unifiedPollRunning = false;
-async function _runUnifiedPoll(){
-  if(_unifiedPollRunning) return;
-  _unifiedPollRunning = true;
-  try{
-    if(_currentUser && _ablyReady) await sbPushMyStats();
-    await chatPoll(false);
-    await _checkDuelInvitePoll();
-  }catch(e){}finally{ _unifiedPollRunning=false; }
-}
-
-async function _fetchAllUsers(force=false){
-  if(!_ablyReady) return _usersCache;
-  const now = Date.now();
-  if(!force && _usersCache.length && (now-_usersCacheTs)<_getUsersCacheTTL()) return _usersCache;
-  try{
-    const idxRaw = await storageGet('ecg_math_users:index', true);
-    if(!idxRaw) return _usersCache;
-    const idx = JSON.parse(idxRaw.value);
-    if(!idx.keys?.length) return _usersCache;
-    const raws = await Promise.all(idx.keys.map(k=>storageGet(k,true).catch(()=>null)));
-    const users = [];
-    raws.forEach(raw=>{ if(raw) try{ users.push(JSON.parse(raw.value)); }catch(e){} });
-    // TOUS les users restent dans le scoreboard — seul sbLogout retire
-    _usersCache = users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
-    _usersCacheTs = now;
-  }catch(e){}
-  return _usersCache;
+  // Retour au premier plan — re-enter presence au cas où la connexion a été perdue
+  document.addEventListener('visibilitychange', () => {
+    if(!document.hidden){
+      if(_currentUser && _ablyReady) _presenceEnter();
+    }
+  });
 }
 
 // ─── Push stats ─────────────────────────────────────────────────
@@ -3060,37 +3084,76 @@ async function sbPushMyStats(extra={}){
   _sbPushInProgress = true;
   try{
     const scores = {total: Math.round(mastPct(FICHES)*10)/10};
-    Object.keys(DOMAINS).forEach(dk=>{ scores[dk]=Math.round(mastPct(FICHES.filter(f=>f.domain===dk))*10)/10; });
+    Object.keys(DOMAINS).forEach(dk=>{
+      scores[dk] = Math.round(mastPct(FICHES.filter(f=>f.domain===dk))*10)/10;
+    });
     const prev = await storageGet(_currentUser.key, true);
     const prevData = prev ? JSON.parse(prev.value) : {};
-    const dw = Math.max(prevData.duelsWon||0, extra.duelsWon||0);
+    const dw = Math.max(prevData.duelsWon||0,  extra.duelsWon||0);
     const dp = Math.max(prevData.duelsPlayed||0, extra.duelsPlayed||0);
     const userData = {
-      name: _currentUser.name, color: _currentUser.color,
-      pwHash: _currentUser.pwHash||prevData.pwHash||'',
-      lastSeen: Date.now(), online: true,
-      scores, streak: getStreak(),
-      bestStreak: Math.max(_getStoredBestStreak(), prevData.bestStreak||0, _sessionBestStreak||0),
-      mastered: mastCount(FICHES), totalFiches: FICHES.length,
-      duelsWon: dw, duelsPlayed: dp,
-      mastery: MASTERY,
+      name:      _currentUser.name,
+      color:     _currentUser.color,
+      pwHash:    _currentUser.pwHash||prevData.pwHash||'',
+      lastSeen:  Date.now(),
+      online:    true,
+      scores,
+      streak:      getStreak(),
+      bestStreak:  Math.max(_getStoredBestStreak(), prevData.bestStreak||0, _sessionBestStreak||0),
+      mastered:    mastCount(FICHES),
+      totalFiches: FICHES.length,
+      duelsWon:  dw,
+      duelsPlayed: dp,
+      mastery:   MASTERY,
     };
     await storageSet(_currentUser.key, JSON.stringify(userData), true);
     if(!_sbUserIndexed){
       const idxRaw = await storageGet('ecg_math_users:index', true);
-      const idx = idxRaw ? JSON.parse(idxRaw.value) : {keys:[]};
+      const idx    = idxRaw ? JSON.parse(idxRaw.value) : {keys:[]};
       if(!idx.keys.includes(_currentUser.key)){
         idx.keys.push(_currentUser.key);
         await storageSet('ecg_math_users:index', JSON.stringify(idx), true);
       }
       _sbUserIndexed = true;
     }
-  }catch(e){}finally{ _sbPushInProgress=false; }
+  }catch(e){}finally{ _sbPushInProgress = false; }
 }
 
+function _onAblyUserUpdate(value){
+  try{
+    const u = JSON.parse(value);
+    const idx = _usersCache.findIndex(x=>x.name===u.name);
+    if(idx>=0) _usersCache[idx]=u; else _usersCache.push(u);
+    _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
+    _usersCacheTs = Date.now();
+    _patchScoreboardRow(u);
+  }catch(e){}
+}
+
+async function _fetchAllUsers(force=false){
+  if(!_ablyReady) return _usersCache;
+  const now = Date.now();
+  if(!force && _usersCache.length && (now-_usersCacheTs)<USERS_CACHE_TTL) return _usersCache;
+  try{
+    const idxRaw = await storageGet('ecg_math_users:index', true);
+    if(!idxRaw) return _usersCache;
+    const idx = JSON.parse(idxRaw.value);
+    if(!idx.keys?.length) return _usersCache;
+    const raws = await Promise.all(idx.keys.map(k=>storageGet(k,true).catch(()=>null)));
+    const users = [];
+    raws.forEach(raw=>{ if(raw) try{ users.push(JSON.parse(raw.value)); }catch(e){} });
+    // Tous les users restent dans le scoreboard — seul sbLogout retire
+    _usersCache = users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
+    _usersCacheTs = now;
+    // Mettre à jour le scoreboard si ouvert
+    const sbContent = document.getElementById('sb-content');
+    if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
+  }catch(e){}
+  return _usersCache;
+}
+
+// Marque offline dans le KV (appelé par sbLogout uniquement)
 async function sbSetOffline(){
-  // Marque offline dans le KV mais ne retire PAS du scoreboard
-  // (la suppression du scoreboard se fait uniquement via sbLogout)
   if(!_currentUser || !_ablyReady) return;
   try{
     const prev = await storageGet(_currentUser.key, true);
@@ -3102,10 +3165,9 @@ async function sbSetOffline(){
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  UI PRÉSENCE — compteur en ligne (Ably Presence natif)
+//  UI PRÉSENCE — source unique : _presenceMembers
 // ══════════════════════════════════════════════════════════════════
 function updateOnlineCount(){
-  // Source : Ably Presence → instantané, zéro polling
   const members = Object.values(_presenceMembers);
   const n = members.length;
 
@@ -3113,31 +3175,26 @@ function updateOnlineCount(){
   const el = document.getElementById('tp-online-n');
   if(el) el.textContent = n>0 ? n : '—';
 
-  // Dot
+  // Dot animé
   const dot = document.getElementById('tp-online-dot');
   if(dot){
-    dot.style.background = n>0 ? '#2ecc71' : '#555';
-    dot.style.animation = n>0 ? 'pulse-online 2s ease-in-out infinite' : 'none';
-    dot.style.opacity = n>0 ? '1' : '0.35';
+    dot.style.background  = n>0 ? '#2ecc71' : '#555';
+    dot.style.animation   = n>0 ? 'pulse-online 2s ease-in-out infinite' : 'none';
+    dot.style.opacity     = n>0 ? '1' : '0.35';
   }
 
   // Label
   const lbl = document.getElementById('tp-online-label');
-  if(lbl) lbl.textContent = ' En ligne';
+  if(lbl) lbl.textContent = ' en ligne';
 
-  // Tooltip
+  // Tooltip hover
   const avatarsEl = document.getElementById('tp-online-avatars');
   if(avatarsEl){
     if(n===0){
-      avatarsEl.innerHTML='<span style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">Personne en ligne</span>';
+      avatarsEl.innerHTML = '<span style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">Personne en ligne</span>';
     } else {
-      avatarsEl.innerHTML = members.slice(0,8).map(u=>`
-        <div style="display:flex;align-items:center;gap:7px;margin-bottom:3px">
-          <div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff">${(u.name||'?')[0].toUpperCase()}</div>
-          <span style="font-family:var(--ff-mono);font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px">${u.name}</span>
-          <span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span>
-        </div>`).join('')
-        + (n>8?`<div style="font-family:var(--ff-mono);font-size:8px;color:var(--t4);margin-top:2px">+${n-8} autres</div>`:'');
+      avatarsEl.innerHTML = members.slice(0,8).map(u=>`<div style="display:flex;align-items:center;gap:7px;margin-bottom:3px"><div style="width:18px;height:18px;border-radius:50%;background:${u.color||'var(--navy)'};display:flex;align-items:center;justify-content:center;font-family:var(--ff-mono);font-size:8px;font-weight:700;color:#fff">${(u.name||'?')[0].toUpperCase()}</div><span style="font-family:var(--ff-mono);font-size:9px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px">${u.name}</span><span style="width:6px;height:6px;background:#2ecc71;border-radius:50%;margin-left:auto;box-shadow:0 0 4px #2ecc71"></span></div>`).join('')
+        + (n>8 ? `<div style="font-family:var(--ff-mono);font-size:8px;color:var(--t4);margin-top:2px">+${n-8} autres</div>` : '');
     }
   }
 
@@ -3147,28 +3204,25 @@ function updateOnlineCount(){
 
   // Sidebar footer
   const sbFoot = document.getElementById('sb-online-foot');
-  if(sbFoot){ sbFoot.textContent=n>0?n+' en ligne':'hors ligne'; sbFoot.style.color=n>0?'#2ecc71':'var(--t4)'; }
+  if(sbFoot){ sbFoot.textContent = n>0 ? n+' en ligne' : 'hors ligne'; sbFoot.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
 
   // Chat pill
   const pill = document.getElementById('chat-online-pill');
-  if(pill){ pill.textContent=n>0?n+' en ligne':'hors ligne'; pill.style.color=n>0?'#2ecc71':'var(--t4)'; }
+  if(pill){ pill.textContent = n>0 ? n+' en ligne' : 'hors ligne'; pill.style.color = n>0 ? '#2ecc71' : 'var(--t4)'; }
 
-  // Badges scoreboard inline — SOURCE UNIQUE via _getPresenceNames()
+  // Badges inline scoreboard (patch léger sans re-render)
   const presenceNames = _getPresenceNames();
-  const sbContent = document.getElementById('sb-user-list');
-  if(sbContent?.children.length>0){
-    _usersCache.forEach(u=>{
-      const row = document.getElementById('sb-row-'+u.name);
-      if(!row) return;
-      const badge = row.querySelector('.sb-online-badge');
-      const ring = row.querySelector('.sb-avatar-ring');
-      const online = presenceNames.has(u.name);
-      if(badge) badge.innerHTML = online
-        ? '<span style="font-family:var(--ff-mono);font-size:7px;color:#2ecc71">● EN LIGNE</span>'
-        : u.lastSeen?`<span style="font-family:var(--ff-mono);font-size:7px;color:var(--t4)">○ ${timeAgo(u.lastSeen)}</span>`:'';
-      if(ring) ring.style.boxShadow = online ? '0 0 0 2px var(--s1),0 0 0 3.5px #2ecc71' : 'none';
-    });
-  }
+  _usersCache.forEach(u=>{
+    const row = document.getElementById('sb-row-'+u.name);
+    if(!row) return;
+    const badge = row.querySelector('.sb-online-badge');
+    const ring  = row.querySelector('.sb-avatar-ring');
+    const on    = presenceNames.has(u.name);
+    if(badge) badge.innerHTML = on
+      ? '<span style="font-family:var(--ff-mono);font-size:7px;color:#2ecc71">● EN LIGNE</span>'
+      : (u.lastSeen ? `<span style="font-family:var(--ff-mono);font-size:7px;color:var(--t4)">○ ${timeAgo(u.lastSeen)}</span>` : '');
+    if(ring) ring.style.boxShadow = on ? '0 0 0 2px var(--s1),0 0 0 3.5px #2ecc71' : 'none';
+  });
 }
 
 function _patchScoreboardRow(u){
@@ -3180,15 +3234,14 @@ function _patchScoreboardRow(u){
 
 // ══════════════════════════════════════════════════════════════════
 //  LOGIN / LOGOUT
-//  Règle : non connecté = pas dans le scoreboard, pas de présence
 // ══════════════════════════════════════════════════════════════════
 function updateSbUI(){
   const el = document.getElementById('tp-user');
   if(el){
     if(_currentUser){
-      el.innerHTML=`<div style="width:26px;height:26px;border-radius:50%;background:${_currentUser.color};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;cursor:pointer" onclick="go('scoreboard')" title="${_currentUser.name}">${_currentUser.name[0].toUpperCase()}</div>`;
+      el.innerHTML = `<div style="width:26px;height:26px;border-radius:50%;background:${_currentUser.color};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;cursor:pointer" onclick="go('scoreboard')" title="${_currentUser.name}">${_currentUser.name[0].toUpperCase()}</div>`;
     } else {
-      el.innerHTML=`<button style="font-family:var(--ff-mono);font-size:9px;padding:4px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:4px;color:var(--t3);cursor:pointer;white-space:nowrap" onclick="showLoginModal()">🏆 Connexion</button>`;
+      el.innerHTML = `<button style="font-family:var(--ff-mono);font-size:9px;padding:4px 10px;background:var(--s2);border:1px solid var(--bd);border-radius:4px;color:var(--t3);cursor:pointer;white-space:nowrap" onclick="showLoginModal()">🏆 Connexion</button>`;
     }
   }
   const loginBtn = document.getElementById('nav-login-btn');
@@ -3209,9 +3262,9 @@ async function sbLogin(name, password=''){
   try{
     const res = await storageGet(key, true);
     if(res){
-      existingData = JSON.parse(res.value);
-      color = existingData.color;
-      existingPwHash = existingData.pwHash||'';
+      existingData     = JSON.parse(res.value);
+      color            = existingData.color;
+      existingPwHash   = existingData.pwHash||'';
     }
   }catch(e){}
 
@@ -3219,7 +3272,6 @@ async function sbLogin(name, password=''){
     _showLoginError('Mot de passe incorrect.');
     return false;
   }
-
   if(!color){
     const idx = Math.abs(name.split('').reduce((a,ch)=>a+ch.charCodeAt(0),0)) % USER_COLORS.length;
     color = USER_COLORS[idx];
@@ -3242,13 +3294,16 @@ async function sbLogin(name, password=''){
   }
 
   _sbUserIndexed = false;
-  // Lancer présence + push stats EN PARALLÈLE pour connexion instantanée
-  sbStartHeartbeat();
   updateSbUI();
   document.getElementById('sb-login-modal')?.remove();
   if(_currentView==='scoreboard') go('scoreboard');
-  // En arrière-plan : push stats + entrer dans la présence simultanément
-  Promise.all([sbPushMyStats(), _presenceEnter()]).catch(()=>{});
+
+  // Connexion instantanée : présence + stats en parallèle
+  Promise.all([_presenceEnter(), sbPushMyStats()]).catch(()=>{});
+  sbStartHeartbeat();
+  // Charger l'historique chat pour cet utilisateur
+  _loadChatHistory();
+  chatRenderFooter();
   return true;
 }
 
@@ -3259,18 +3314,18 @@ function _showLoginError(msg){
 
 async function sbLogout(){
   if(_currentUser){
-    // Retirer physiquement du scoreboard (online=false + retrait cache)
+    await _presenceLeave(); // quitte la présence Ably immédiatement
+    // Retirer de l'index KV → plus dans le scoreboard pour tout le monde
     try{
-      const prev = await storageGet(_currentUser.key, true);
-      if(prev){
-        const d = JSON.parse(prev.value);
-        d.online = false; d.lastSeen = Date.now();
-        await storageSet(_currentUser.key, JSON.stringify(d), true);
+      const idxRaw = await storageGet('ecg_math_users:index', true);
+      if(idxRaw){
+        const idx = JSON.parse(idxRaw.value);
+        idx.keys = idx.keys.filter(k => k !== _currentUser.key);
+        await storageSet('ecg_math_users:index', JSON.stringify(idx), true);
       }
     }catch(e){}
-    // Retirer du cache local → disparaît immédiatement du scoreboard
+    // Retirer du cache local immédiatement
     _usersCache = _usersCache.filter(u=>u.name!==_currentUser.name);
-    await _presenceLeave(); // disparaît du compteur en ligne
   }
   _currentUser = null;
   localStorage.removeItem('ecg_math_username');
@@ -3278,6 +3333,7 @@ async function sbLogout(){
   _sbUserIndexed = false;
   if(_onlineHeartbeat){ clearTimeout(_onlineHeartbeat); _onlineHeartbeat=null; }
   updateSbUI();
+  chatRenderFooter();
   if(_currentView==='scoreboard') go('scoreboard');
 }
 
@@ -3301,8 +3357,8 @@ function showLoginModal(){
         <button onclick="const i=document.getElementById('sb-pw-input');i.type=i.type==='password'?'text':'password'" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--t4);cursor:pointer;font-size:13px">👁</button>
       </div>
       <div id="sb-login-error" style="display:none;font-family:var(--ff-mono);font-size:10px;color:var(--red);padding:6px 10px;background:var(--redbg);border-radius:5px;border:1px solid rgba(209,82,72,.2)"></div>
-      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4);line-height:1.6">Pseudo visible de tous · Sans mot de passe = accès libre</div>
-      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--orange);padding:6px 10px;background:var(--orangebg);border-radius:5px;border:1px solid rgba(208,128,64,.2);line-height:1.6">⚠️ N'utilise pas un mot de passe personnel — choisis un code dédié (ex: maths2026)</div>
+      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">Pseudo visible de tous · Sans mdp = accès libre</div>
+      <div style="font-family:var(--ff-mono);font-size:9px;color:var(--orange);padding:6px 10px;background:var(--orangebg);border-radius:5px;border:1px solid rgba(208,128,64,.2)">⚠️ N'utilise pas un mot de passe personnel</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:18px">
       <button onclick="sbLoginFromModal()" style="flex:1;padding:10px;background:var(--navy);color:#fff;border:none;border-radius:8px;font-size:13px;cursor:pointer;font-weight:500" id="sb-login-submit-btn">Connexion</button>
@@ -3315,8 +3371,8 @@ function showLoginModal(){
 
 async function sbLoginFromModal(){
   const name = document.getElementById('sb-name-input')?.value;
-  const pw = document.getElementById('sb-pw-input')?.value||'';
-  const btn = document.getElementById('sb-login-submit-btn');
+  const pw   = document.getElementById('sb-pw-input')?.value||'';
+  const btn  = document.getElementById('sb-login-submit-btn');
   if(!name?.trim()) return;
   if(btn){ btn.disabled=true; btn.textContent='Connexion…'; }
   const ok = await sbLogin(name, pw);
@@ -3325,17 +3381,26 @@ async function sbLoginFromModal(){
 
 async function initUser(){
   await ablyInit();
+  // Bootstrap 1 : localStorage (instantané)
+  _bootstrapKVFromLocalStorage();
+  // Bootstrap 2 : Ably history (pour voir les autres users, pas juste soi)
   if(_ablyReady){
     try{
-      const page = await _ablyChannel('ecg:kv').history({limit:200, direction:'backwards'});
-      for(const msg of (page?.items||[])){
-        if(msg.name==='set' && msg.data?.key && _kv[msg.data.key]===undefined){
-          _kv[msg.data.key] = msg.data.value;
+      let page = await _ablyChannel('ecg:kv').history({limit:1000, direction:'backwards'});
+      const seenKeys = new Set(Object.keys(_kv));
+      do{
+        for(const msg of (page?.items||[])){
+          if(msg.name==='set' && msg.data?.key && !seenKeys.has(msg.data.key)){
+            seenKeys.add(msg.data.key);
+            _kv[msg.data.key] = msg.data.value;
+          }
         }
-      }
-    }catch(e){}
+        if(page?.hasNext()) page = await page.next();
+        else break;
+      }while(page);
+    }catch(e){ console.warn('[initUser] Ably bootstrap error:', e); }
   }
-  const saved = localStorage.getItem('ecg_math_username');
+  const saved   = localStorage.getItem('ecg_math_username');
   const savedPw = localStorage.getItem('ecg_math_pwhash')||'';
   if(saved){
     if(_ablyReady){ await sbLogin(saved, savedPw ? '__hash__'+savedPw : ''); }
@@ -3345,17 +3410,15 @@ async function initUser(){
       updateSbUI();
     }
   }
-  if(_ablyReady){ updateOnlineCount(); chatPoll(false); }
+  if(_ablyReady){ updateOnlineCount(); }
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  DUEL SYSTEM — invitations via Ably push (zéro polling)
-//  Règle : l'initiateur ATTEND l'acceptation avant de lancer le duel
+//  DUEL — système inchangé (invitations via Ably push)
 // ══════════════════════════════════════════════════════════════════
 let _duelPollTimer2 = null;
 function sbPollDuel(){ /* legacy */ }
 
-// Fallback poll pour les invites (si Ably KV reçu avant subscribe)
 async function _checkDuelInvitePoll(){
   if(!_currentUser||!_ablyReady||_duelState) return;
   try{
@@ -3363,10 +3426,9 @@ async function _checkDuelInvitePoll(){
     const raw = await storageGet(key, true);
     if(!raw) return;
     const inv = JSON.parse(raw.value);
-    if(!inv.from||inv.accepted||inv.declined) return;
+    if(!inv.from||inv.accepted||inv.declined||inv.shown) return;
     if(Date.now()-inv.ts>120000){ await storageSet(key,JSON.stringify({...inv,declined:true}),true); return; }
     _showDuelNotifBanner(inv.from);
-    // Nettoyer pour ne pas re-afficher
     await storageSet(key, JSON.stringify({...inv, shown:true}), true);
   }catch(e){}
 }
@@ -3375,8 +3437,6 @@ async function sbRequestDuel(targetName){
   if(!_currentUser||!_ablyReady) return;
   const targetKey = sbUserKey(targetName);
   const inviteKey = 'duel_invite:'+targetKey;
-
-  // Afficher un état "En attente..." au lieu de lancer immédiatement
   const c = document.getElementById('content');
   if(c){
     c.innerHTML=`<div class="content-inner"><div style="text-align:center;padding:60px 20px">
@@ -3387,23 +3447,12 @@ async function sbRequestDuel(targetName){
       <button class="qnbtn" onclick="_cancelDuelRequest('${targetName}','${inviteKey}')">Annuler</button>
     </div></div>`;
   }
-
-  // Écrire l'invite dans le KV (broadcast Ably → l'adversaire reçoit en push)
-  await storageSet(inviteKey, JSON.stringify({
-    from: _currentUser.name, fromKey: _currentUser.key,
-    to: targetName, ts: Date.now(), accepted: false, declined: false
-  }), true);
-
-  // Publier sur le canal duel pour notif push immédiate
-  try{
-    await _ablyChannel('ecg:duels').publish('invite', {from: _currentUser.name, to: targetName});
-  }catch(e){}
-
-  // Timer de timeout : 60s
+  await storageSet(inviteKey, JSON.stringify({from:_currentUser.name,fromKey:_currentUser.key,to:targetName,ts:Date.now(),accepted:false,declined:false}), true);
+  try{ await _ablyChannel('ecg:duels').publish('invite', {from:_currentUser.name, to:targetName}); }catch(e){}
   _duelState = {waiting:true, opponent:targetName, inviteKey};
   setTimeout(()=>{
     if(_duelState?.waiting && _duelState?.opponent===targetName){
-      _duelState = null;
+      _duelState=null;
       const c2=document.getElementById('content');
       if(c2) c2.innerHTML=`<div class="content-inner"><div style="text-align:center;padding:40px;font-family:var(--ff-mono);font-size:11px;color:var(--t4)">${targetName} n'a pas répondu.<br><button class="qnbtn" onclick="go('scoreboard')" style="margin-top:12px">Retour</button></div></div>`;
     }
@@ -3424,11 +3473,23 @@ function _showDuelNotifBanner(from){
   banner.innerHTML=`<div class="duel-notif-title">⚔️ Défi reçu !</div>
     <div class="duel-notif-sub"><strong>${from}</strong> te défie en duel !</div>
     <div class="duel-notif-btns">
-      <button class="qnbtn qng" onclick="sbAcceptDuel('${from}')" style="font-size:11px;flex:1">Accepter</button>
+      <button class="qnbtn qng" onclick="_acceptDuel('${from}')" style="font-size:11px;flex:1">Accepter</button>
       <button class="qnbtn" onclick="_declineDuel('${from}')" style="font-size:11px">Refuser</button>
     </div>`;
   document.body.appendChild(banner);
   setTimeout(()=>banner.remove(), 30000);
+}
+
+async function _acceptDuel(from){
+  document.getElementById('duel-notif-banner')?.remove();
+  if(!_currentUser||!_ablyReady) return;
+  try{
+    const key = 'duel_invite:'+_currentUser.key;
+    const raw = await storageGet(key, true);
+    if(raw){ const inv=JSON.parse(raw.value); inv.accepted=true; await storageSet(key,JSON.stringify(inv),true); }
+  }catch(e){}
+  try{ await _ablyChannel('ecg:duels').publish('accept', {from:_currentUser.name, to:from}); }catch(e){}
+  _startDuel(from);
 }
 
 async function _declineDuel(from){
@@ -3438,294 +3499,39 @@ async function _declineDuel(from){
   try{ await storageSet(key, JSON.stringify({from,to:_currentUser.name,ts:Date.now(),declined:true,accepted:false}), true); }catch(e){}
 }
 
-async function sbAcceptDuel(opponentName){
-  document.getElementById('duel-notif-banner')?.remove();
-  if(!_currentUser||!_ablyReady) return;
-
-  // Marquer l'invite comme acceptée
-  try{
-    const key = 'duel_invite:'+_currentUser.key;
-    const raw = await storageGet(key, true);
-    if(raw){ const inv=JSON.parse(raw.value); inv.accepted=true; await storageSet(key,JSON.stringify(inv),true); }
-  }catch(e){}
-
-  // Notifier l'initiateur via Ably push
-  try{
-    await _ablyChannel('ecg:duels').publish('accept', {from: opponentName, to: _currentUser.name});
-  }catch(e){}
-
-  // Lancer le duel côté accepteur
-  _startDuel(opponentName);
-}
-
-// Reçu par l'initiateur quand l'adversaire accepte (via Ably push)
-// (géré dans _setupAbly → duelCh.subscribe('accept', ...))
-
-function _seededShuffle(arr, rng){
-  const r = arr.slice();
-  for(let i=r.length-1;i>0;i--){ const j=Math.floor(rng()*(i+1)); [r[i],r[j]]=[r[j],r[i]]; }
-  return r;
-}
-function _duelSeed(nameA, nameB){
-  const sorted = [nameA.toLowerCase(), nameB.toLowerCase()].sort();
-  const base = _dqDateSeed()*1000;
-  let h = base;
-  for(const nm of sorted) for(let i=0;i<nm.length;i++) h=((h<<5)-h+nm.charCodeAt(i))|0;
-  return Math.abs(h);
-}
-
-function _startDuel(opponentName){
-  _duelState = null; // effacer l'état "waiting"
-  const seed = _duelSeed(_currentUser?.name||'', opponentName);
-  const rng = _seededRng(seed);
-  const pool = FICHES.filter(f=>f.quizzes&&f.quizzes.length);
-  if(!pool.length) return;
-  const questions = [], usedIds = new Set();
-  for(let i=0;i<5;i++){
-    let f = pool[Math.floor(rng()*pool.length)], tries=0;
-    while(usedIds.has(f.id)&&tries<20){ f=pool[Math.floor(rng()*pool.length)]; tries++; }
-    usedIds.add(f.id);
-    const q = normalizeQuizItem(f, f.quizzes[Math.floor(rng()*f.quizzes.length)]);
-    const opts = _seededShuffle((q.options||[]).map(opt=>Object.assign({},opt)), rng);
-    questions.push({fiche:f, quiz:q, opts, correctId:(opts.find(opt=>opt.correct)||{}).id});
-  }
-  _duelState = {opponent:opponentName, questions, idx:0, score:0, answered:false, results:[], startTime:Date.now()};
-  go('all-quiz');
-  _renderDuelView();
-}
-
-function _renderDuelView(){
-  if(!_duelState || _duelState.waiting) return;
-  const c = document.getElementById('content'); if(!c) return;
-  const {opponent,questions,idx,score,results} = _duelState;
-  if(idx>=questions.length){ _showDuelFinal(c); return; }
-  const item = questions[idx];
-  const f = item.fiche;
-  const dom = DOMAINS[f.domain]; const col = dom?dom.color:'var(--navy)';
-  c.innerHTML=`<div class="content-inner">
-    <div style="background:linear-gradient(135deg,rgba(218,184,76,.08),rgba(209,82,72,.05));border:1px solid rgba(218,184,76,.2);border-radius:var(--r2);padding:14px 16px;margin-bottom:14px">
-      <div style="display:flex;align-items:center;justify-content:space-between">
-        <div style="display:flex;align-items:center;gap:8px">
-          <span style="font-size:18px">⚔️</span>
-          <div>
-            <div style="font-family:var(--ff-ser);font-size:16px;font-weight:600;color:var(--gold2)">Duel vs ${opponent}</div>
-            <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">Q${idx+1}/5 · ${sanitizeMathText(f.title)}</div>
-          </div>
-        </div>
-        <div style="font-family:var(--ff-mono);font-size:20px;font-weight:700;color:var(--t1)">${score}<span style="font-size:12px;color:var(--t4)">/5</span></div>
-      </div>
-      <div style="display:flex;gap:3px;margin-top:8px">${results.map(r=>`<div style="flex:1;height:4px;border-radius:2px;background:${r?'var(--green)':'var(--red)'}"></div>`).join('')}${Array(5-results.length).fill(0).map((_,j)=>`<div style="flex:1;height:4px;border-radius:2px;background:${j===0?'var(--gold2)':'var(--s3)'}"></div>`).join('')}</div>
-    </div>
-    <div class="qcard" style="border-color:rgba(218,184,76,.2)">
-      <div class="qstripe" style="background:var(--gold2)"></div>
-      <div class="qmode-label">${TYPE_LABELS[f.type]||f.type} — ${dom?dom.name:''}</div>
-      ${item.quiz.context?`<div style="background:var(--s2);border:1px solid var(--bd);border-left:3px solid var(--gold2);border-radius:6px;padding:10px 14px;margin:8px 0;font-size:13px;color:var(--t2);line-height:1.6">${sanitizeMathText(item.quiz.context)}</div>`:''}
-      ${item.quiz.visual?`<div class="qvisual" style="display:block;margin:8px 0;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--s2)">${sanitizeMathText(item.quiz.visual)}</div>`:''}
-      <div class="qquestion" id="duel-q">${sanitizeMathText(item.quiz.q)}</div>
-    </div>
-    <div class="quiz-opts" id="duel-opts">
-      ${item.opts.map((opt,oi)=>`<button class="qopt" data-option-id="${opt.id}" data-idx="${String.fromCharCode(65+oi)}" onclick="_duelAnswer(${oi})">${sanitizeMathText(opt.text)}</button>`).join('')}
-    </div>
-    <div id="duel-fb" style="display:none"></div>
-    <div id="duel-next" style="display:none;margin-top:8px"><button class="qnbtn qng" onclick="_duelNext()">Suivant →</button></div>
-  </div>`;
-  setTimeout(()=>renderMathIn(c), 30);
-}
-
-function _duelAnswer(selectedIdx){
-  if(!_duelState||_duelState.answered) return;
-  _duelState.answered = true;
-  const item = _duelState.questions[_duelState.idx];
-  const options = item.opts||[];
-  const selected = options[selectedIdx];
-  const correctOption = options.find(opt=>opt.correct)||options[0];
-  if(!selected||!correctOption) return;
-  const ok = !!selected.correct;
-  if(ok) _duelState.score++;
-  _duelState.results.push(ok);
-  document.querySelectorAll('#duel-opts .qopt').forEach((b,i)=>{
-    const opt=options[i]; b.disabled=true;
-    if(opt&&opt.correct) b.classList.add('correct');
-    else if(i===selectedIdx&&!ok) b.classList.add('wrong');
-    else b.classList.add('dimmed');
-  });
-  const explanation = item.quiz.explanation||'';
-  const fb = document.getElementById('duel-fb');
-  if(fb){
-    fb.style.display='block'; fb.className='qfb';
-    fb.style.borderLeftColor=ok?'var(--green)':'var(--red)';
-    fb.innerHTML=`<div class="qfv" style="color:${ok?'var(--green)':'var(--red)'}">${ok?'✓ Correct !':'✗ Raté'}</div>
-      ${!ok?`<div style="margin-top:6px"><div style="font-size:12px;color:var(--t1);line-height:1.5">${sanitizeMathText(selected.text)}</div><div style="font-size:11px;color:var(--t3);line-height:1.6;margin-top:4px">${sanitizeMathText(selected.rationale||'')}</div></div>`:''}
-      <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--bd)"><div style="font-family:var(--ff-mono);font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--green);margin-bottom:4px">Bonne réponse</div><div style="font-size:12px;color:var(--t2);line-height:1.5">${sanitizeMathText(correctOption.text)}</div></div>
-      ${explanation?`<div style="font-size:11px;color:var(--t3);margin-top:6px;font-style:italic">💡 ${sanitizeMathText(explanation)}</div>`:''}`;
-    renderMathIn(fb);
-  }
-  const next = document.getElementById('duel-next'); if(next) next.style.display='';
-}
-
-function _duelNext(){
-  if(!_duelState) return;
-  _duelState.idx++; _duelState.answered=false;
-  _renderDuelView();
-}
-
-// Résultat adversaire reçu en temps réel via Ably
-let _pendingDuelFinalData = null;
-function _onOpponentDuelResult(res){
-  _pendingDuelFinalData = res;
-  // Si on est déjà sur la page finale, mettre à jour immédiatement
-  if(document.getElementById('duel-waiting-opponent')){
-    _renderDuelFinalWithOpponent(res);
-  }
-}
-
-async function _showDuelFinal(container){
-  const {opponent, score, results, startTime} = _duelState;
-  const elapsed = Math.round((Date.now()-startTime)/1000);
-  const sortedNames = [_sanitizeStorageKey(_currentUser.name.toLowerCase()), _sanitizeStorageKey(opponent.toLowerCase())].sort();
-  const today = new Date().toISOString().slice(0,10);
-  const duelMatchKey = 'duel_match:'+today+':'+sortedNames.join('_vs_');
-  const myResultKey = duelMatchKey+':'+_currentUser.name.toLowerCase();
-
-  // Sauvegarder mon résultat + broadcaster via Ably
-  if(_currentUser&&_ablyReady){
-    try{
-      const myResult = {player:_currentUser.name, opponent, score, total:5, time:elapsed, ts:Date.now()};
-      await storageSet(myResultKey, JSON.stringify(myResult), true);
-      const globalKey = 'duel_result:'+Date.now()+':'+_sanitizeStorageKey(_currentUser.name);
-      await storageSet(globalKey, JSON.stringify(myResult), true);
-      // Broadcaster via Ably → adversaire reçoit en push immédiat
-      await _ablyChannel('ecg:duels').publish('result', myResult);
-      // Incrémenter duelsPlayed
-      while(_sbPushInProgress) await new Promise(r=>setTimeout(r,50));
-      _sbPushInProgress=true;
-      try{
-        const prev=await storageGet(_currentUser.key,true);
-        if(prev){ const d=JSON.parse(prev.value); d.duelsPlayed=(d.duelsPlayed||0)+1; await storageSet(_currentUser.key,JSON.stringify(d),true); }
-      }finally{ _sbPushInProgress=false; }
-    }catch(e){}
-  }
-
-  // Vérifier si on a déjà le résultat adverse (arrivé en push pendant qu'on jouait)
-  let oppData = _pendingDuelFinalData;
-  _pendingDuelFinalData = null;
-  if(!oppData){
-    try{
-      const oppKey = duelMatchKey+':'+opponent.toLowerCase();
-      const oppRaw = await storageGet(oppKey, true);
-      if(oppRaw) oppData = JSON.parse(oppRaw.value);
-    }catch(e){}
-  }
-
-  _duelState = null;
-
-  if(oppData){ _renderDuelFinalWithOpponent(oppData, container, score, elapsed, opponent, results); }
-  else { _renderDuelFinalWaiting(container, score, elapsed, opponent, results, duelMatchKey); }
-}
-
-function _calcOutcome(myScore, oppScore, myTime, oppTime){
-  if(myScore>oppScore) return {outcome:'win',emoji:'🏆',text:'Victoire !',color:'var(--green)'};
-  if(myScore<oppScore) return {outcome:'lose',emoji:'💀',text:'Défaite…',color:'var(--red)'};
-  if(myTime<oppTime)   return {outcome:'win',emoji:'🏆',text:'Victoire au temps !',color:'var(--green)'};
-  if(myTime>oppTime)   return {outcome:'lose',emoji:'💀',text:'Défaite au temps…',color:'var(--red)'};
-  return {outcome:'draw',emoji:'🤝',text:'Égalité parfaite !',color:'var(--gold2)'};
-}
-
-function _duelFinalButtons(opponent){
-  return `<div style="display:flex;gap:8px;justify-content:center;margin-top:16px">
-    <button class="qnbtn qng" onclick="go('scoreboard')">🏆 Scoreboard</button>
-    <button class="qnbtn" onclick="_startDuel('${opponent}')">↺ Revanche</button>
-    <button class="qnbtn" onclick="go('home')">🏠 Accueil</button>
-  </div>`;
-}
-
-function _renderDuelFinalWithOpponent(oppData, container, myScore, myTime, opponent, results){
-  // Si appelé depuis _onOpponentDuelResult (mise à jour en push)
-  const c = container || document.getElementById('content');
-  if(!c) return;
-  const opp = oppData;
-  const {outcome,emoji,text,color} = _calcOutcome(myScore, opp.score, myTime, opp.time);
-  // Mettre à jour duelsWon si victoire
-  if(outcome==='win' && _currentUser && _ablyReady){
-    (async()=>{
-      while(_sbPushInProgress) await new Promise(r=>setTimeout(r,50));
-      _sbPushInProgress=true;
-      try{
-        const prev=await storageGet(_currentUser.key,true);
-        if(prev){ const d=JSON.parse(prev.value); d.duelsWon=(d.duelsWon||0)+1; await storageSet(_currentUser.key,JSON.stringify(d),true); }
-      }finally{ _sbPushInProgress=false; }
-    })();
-  }
-  const res = results||[];
-  c.innerHTML=`<div class="content-inner"><div class="qfinal" style="border:1px solid rgba(218,184,76,.2)">
-    <div style="font-size:36px;margin-bottom:8px">${emoji}</div>
-    <div style="font-family:var(--ff-ser);font-size:26px;font-weight:600;color:var(--t1)">Duel terminé !</div>
-    <div style="font-family:var(--ff-mono);font-size:11px;color:var(--t3);margin:8px 0">vs ${opp.player||opponent}</div>
-    <div style="font-family:var(--ff-mono);font-size:16px;font-weight:700;color:${color};margin:8px 0">${text}</div>
-    <div style="display:flex;align-items:center;justify-content:center;gap:20px;margin:16px 0;padding:14px;background:var(--s2);border:1px solid var(--bd);border-radius:8px">
-      <div style="text-align:center">
-        <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4);margin-bottom:4px">Toi</div>
-        <div style="font-family:var(--ff-mono);font-size:24px;font-weight:700;color:${myScore>=opp.score?'var(--green)':'var(--t3)'}">${myScore}/5</div>
-        <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">${myTime}s</div>
-      </div>
-      <div style="font-size:18px;color:var(--t4)">vs</div>
-      <div style="text-align:center">
-        <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4);margin-bottom:4px">${opp.player||opponent}</div>
-        <div style="font-family:var(--ff-mono);font-size:24px;font-weight:700;color:${opp.score>myScore?'var(--green)':'var(--t3)'}">${opp.score}/5</div>
-        <div style="font-family:var(--ff-mono);font-size:9px;color:var(--t4)">${opp.time||'?'}s</div>
-      </div>
-    </div>
-    <div style="display:flex;gap:4px;justify-content:center;margin:12px 0">${res.map(r=>`<div style="width:24px;height:24px;border-radius:50%;background:${r?'var(--greenbg)':'var(--redbg)'};border:1px solid ${r?'rgba(58,154,114,.3)':'rgba(209,82,72,.3)'};display:flex;align-items:center;justify-content:center;font-size:11px">${r?'✓':'✗'}</div>`).join('')}</div>
-    ${_duelFinalButtons(opp.player||opponent)}
-  </div></div>`;
-}
-
-function _renderDuelFinalWaiting(container, myScore, myTime, opponent, results, duelMatchKey){
-  const c = container || document.getElementById('content'); if(!c) return;
-  const res = results||[];
-  c.innerHTML=`<div class="content-inner"><div class="qfinal" style="border:1px solid rgba(218,184,76,.2)">
-    <div style="font-size:36px;margin-bottom:8px">⏳</div>
-    <div style="font-family:var(--ff-ser);font-size:22px;font-weight:600;color:var(--t1)">Duel terminé — ton côté !</div>
-    <div style="font-family:var(--ff-mono);font-size:12px;color:var(--gold2);margin:12px 0;padding:10px;background:var(--goldbg);border:1px solid rgba(218,184,76,.2);border-radius:6px">
-      Ton score : <strong>${myScore}/5</strong> en ${myTime}s<br>
-      <span id="duel-waiting-opponent">En attente du résultat de ${opponent}…</span>
-    </div>
-    <div style="display:flex;gap:4px;justify-content:center;margin:12px 0">${res.map(r=>`<div style="width:24px;height:24px;border-radius:50%;background:${r?'var(--greenbg)':'var(--redbg)'};border:1px solid ${r?'rgba(58,154,114,.3)':'rgba(209,82,72,.3)'};display:flex;align-items:center;justify-content:center;font-size:11px">${r?'✓':'✗'}</div>`).join('')}</div>
-    ${_duelFinalButtons(opponent)}
-  </div></div>`;
-  // Stocker les données pour mise à jour en push
-  _pendingDuelFinalData = null;
-  // Les données myScore/myTime/opponent/results sont capturées pour quand _onOpponentDuelResult est appelé
-  _duelState = {waitingFinal:true, myScore, myTime, opponent, results, duelMatchKey};
-}
-
-// Appelé quand le résultat adverse arrive via Ably push (pendant la page d'attente)
-function _onOpponentDuelResult(res){
-  if(_duelState?.waitingFinal){
-    const {myScore, myTime, opponent, results} = _duelState;
-    _duelState = null;
-    _renderDuelFinalWithOpponent(res, null, myScore, myTime, opponent, results);
-  } else {
-    _pendingDuelFinalData = res;
-  }
-}
-
-async function _refreshDuelResult(opponent, myScore, myTime){ /* legacy — now handled by Ably push */ }
+// sbAcceptDuel alias
+async function sbAcceptDuel(from){ await _acceptDuel(from); }
 
 // ══════════════════════════════════════════════════════════════════
-//  CHAT
+//  CHAT — pub/sub Ably pur (plus de KV pour le chat)
+//  • Envoyer = publish sur ecg:chat
+//  • Recevoir = subscribe sur ecg:chat
+//  • Historique = Ably message history (72h)
+//  • TTL local : on garde 5h en mémoire
 // ══════════════════════════════════════════════════════════════════
-const CHAT_KEY='ecg_math_chat:messages';
-const CHAT_TTL=5*60*60*1000;
-const CHAT_POLL_MS=5000;
-const CHAT_MAX=120;
-let _chatMsgs=[], _chatOpen=false, _chatPollTimer=null, _chatUnread=0, _chatLastSeen=0;
+const CHAT_KEY = 'ecg_math_chat:messages'; // gardé pour compat legacy
+const CHAT_TTL = 5*60*60*1000;
+const CHAT_MAX = 200;
+let _chatMsgs=[], _chatOpen=false, _chatUnread=0, _chatLastSeen=0;
+let _chatHistoryLoaded = false;
+
 const CHAT_BAD=['putain','merde','connard','connasse','salope','pute','enculé','fdp','ntm','tg'];
-function chatModerate(text){ let t=text.trim().slice(0,240); CHAT_BAD.forEach(w=>{ t=t.replace(new RegExp(w,'gi'),w[0]+'*'.repeat(w.length-1)); }); return t; }
-function _chatMarkRead(){ _chatUnread=0; _chatLastSeen=Date.now(); _chatRefreshBadge(); }
+function chatModerate(text){
+  let t = text.trim().slice(0,240);
+  CHAT_BAD.forEach(w=>{ t=t.replace(new RegExp(w,'gi'), w[0]+'*'.repeat(w.length-1)); });
+  return t;
+}
+
+function _chatMarkRead(){
+  _chatUnread = 0;
+  if(_chatMsgs.length) _chatLastSeen = _chatMsgs[_chatMsgs.length-1].ts;
+  _chatRefreshBadge();
+}
+
 function _chatRefreshBadge(){
-  const badge=document.getElementById('chat-badge'); const btn=document.getElementById('chat-toggle-btn');
-  const navBadge=document.getElementById('chat-badge-nav');
+  const badge    = document.getElementById('chat-badge');
+  const btn      = document.getElementById('chat-toggle-btn');
+  const navBadge = document.getElementById('chat-badge-nav');
   if(_chatUnread>0){
     if(badge){ badge.style.display='block'; badge.textContent=_chatUnread>9?'9+':_chatUnread; }
     if(btn) btn.classList.add('has-unread');
@@ -3736,58 +3542,76 @@ function _chatRefreshBadge(){
     if(navBadge) navBadge.style.display='none';
   }
 }
-async function chatPoll(force=false){
-  if(!_ablyReady) return;
+
+// Charger l'historique Ably (appelé au démarrage et au login)
+async function _loadChatHistory(){
+  if(!_ablyReady || _chatHistoryLoaded) return;
   try{
-    const raw=await storageGet(CHAT_KEY,true);
-    const msgs=raw?JSON.parse(raw.value):[];
-    const now=Date.now();
-    const fresh=msgs.filter(m=>(now-m.ts)<CHAT_TTL);
-    const changed=fresh.length!==_chatMsgs.length||(fresh.length>0&&_chatMsgs.length>0&&fresh[fresh.length-1].ts!==_chatMsgs[_chatMsgs.length-1].ts);
-    _chatMsgs=fresh;
-    if(changed||force){
-      if(_chatOpen){ chatRenderMessages(); _chatMarkRead(); }
-      else{
-        const me=_currentUser?.name;
-        // Count messages from OTHER users that arrived after we last looked
-        const newMsgs=fresh.filter(m=>m.ts>_chatLastSeen&&m.author!==me);
-        if(newMsgs.length>0){ _chatUnread=newMsgs.length; _chatRefreshBadge(); }
-      }
-    }
-    const pill=document.getElementById('chat-online-pill');
-    if(pill){ const n=_usersCache.filter(u=>isOnline(u)).length; pill.textContent=n>0?n+' en ligne':'hors ligne'; pill.style.color=n>0?'#2ecc71':'var(--t4)'; }
-  }catch(e){}
+    const ch   = _ablyChannel('ecg:chat');
+    const page = await ch.history({limit: CHAT_MAX, direction:'backwards'});
+    const items = (page?.items||[]).reverse(); // du plus ancien au plus récent
+    const now  = Date.now();
+    items.forEach(msg => {
+      const m = msg.data;
+      if(!m || !m.ts || !m.author) return;
+      if((now - m.ts) >= CHAT_TTL) return; // ignorer les trop vieux
+      const exists = _chatMsgs.some(x=>x.ts===m.ts && x.author===m.author);
+      if(!exists) _chatMsgs.push(m);
+    });
+    _chatMsgs.sort((a,b)=>a.ts-b.ts);
+    _chatMsgs = _chatMsgs.slice(-CHAT_MAX);
+    _chatHistoryLoaded = true;
+    if(_chatOpen) chatRenderMessages();
+    // Compter les non-lus
+    const me = _currentUser?.name;
+    const unread = _chatMsgs.filter(m=>m.ts>_chatLastSeen&&m.author!==me).length;
+    if(unread>0){ _chatUnread=unread; _chatRefreshBadge(); }
+  }catch(e){ console.warn('[Chat] history load error:', e); }
 }
-function chatStartPoll(){ /* legacy — géré par _runUnifiedPoll adaptatif */ }
+
+// chatPoll : legacy — maintenant on reçoit tout en push via subscribe
+// Gardé pour compatibilité avec _runUnifiedPoll
+async function chatPoll(force=false){ /* no-op — chat géré par subscribe Ably */ }
+function chatStartPoll(){ /* no-op */ }
+
 function chatToggle(){ if(_chatOpen) chatClose(); else chatOpen(); }
+
 function chatOpen(){
-  _chatOpen=true;
+  _chatOpen = true;
   document.getElementById('chat-panel').classList.add('open');
-  chatRenderMessages(); chatRenderFooter(); _chatMarkRead();
-  // Force immediate poll to get latest messages
-  chatPoll(true);
+  chatRenderMessages();
+  chatRenderFooter();
+  _chatMarkRead();
+  // Si historique pas encore chargé, le charger maintenant
+  if(!_chatHistoryLoaded) _loadChatHistory();
 }
+
 function chatClose(){
-  _chatOpen=false;
+  _chatOpen = false;
   document.getElementById('chat-panel').classList.remove('open');
 }
+
 function chatRenderMessages(){
-  const container=document.getElementById('chat-messages'); if(!container) return;
-  const me=_currentUser?.name;
-  if(!_chatMsgs.length){ container.innerHTML=`<div class="chat-empty">Aucun message.<br>Sois le premier !</div>`; return; }
-  const wasAtBottom=container.scrollHeight-container.scrollTop-container.clientHeight<60;
-  const GROUP_GAP=3*60*1000;
-  let html='';
-  _chatMsgs.forEach((m,idx)=>{
-    const isMe=m.author===me;
-    const prev=_chatMsgs[idx-1];
-    const isGrouped=prev&&prev.author===m.author&&(m.ts-prev.ts)<GROUP_GAP;
-    const timeStr=new Date(m.ts).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
-    const colorStyle=m.color?`background:${m.color}`:'background:var(--t4)';
+  const container = document.getElementById('chat-messages');
+  if(!container) return;
+  const me = _currentUser?.name;
+  if(!_chatMsgs.length){
+    container.innerHTML = `<div class="chat-empty">Aucun message.<br>Sois le premier !</div>`;
+    return;
+  }
+  const wasAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
+  const GROUP_GAP = 3*60*1000;
+  let html = '';
+  _chatMsgs.forEach((m, idx)=>{
+    const isMe = m.author === me;
+    const prev = _chatMsgs[idx-1];
+    const isGrouped = prev && prev.author===m.author && (m.ts-prev.ts)<GROUP_GAP;
+    const timeStr = new Date(m.ts).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+    const colorStyle = m.color ? `background:${m.color}` : 'background:var(--t4)';
     if(isGrouped){
-      html+=`<div class="chat-msg${isMe?' me':''}" style="margin-top:2px"><div class="chat-bubble">${m.text}</div></div>`;
+      html += `<div class="chat-msg${isMe?' me':''}" style="margin-top:2px"><div class="chat-bubble">${m.text}</div></div>`;
     } else {
-      html+=`<div class="chat-msg${isMe?' me':''}" style="margin-top:10px">
+      html += `<div class="chat-msg${isMe?' me':''}" style="margin-top:10px">
         <div class="chat-msg-header">
           <div class="chat-msg-avatar" style="${colorStyle}">${m.author[0].toUpperCase()}</div>
           <span class="chat-msg-name">${isMe?'Vous':m.author}</span>
@@ -3797,40 +3621,51 @@ function chatRenderMessages(){
       </div>`;
     }
   });
-  container.innerHTML=html;
-  if(wasAtBottom||_chatMsgs.length<=3) container.scrollTop=container.scrollHeight;
+  container.innerHTML = html;
+  if(wasAtBottom || _chatMsgs.length<=3) container.scrollTop = container.scrollHeight;
 }
+
 function chatRenderFooter(){
-  const footer=document.getElementById('chat-footer'); if(!footer) return;
-  if(!_currentUser){ footer.innerHTML=`<div class="chat-login-hint">Connecte-toi pour participer au chat.</div>`; return; }
-  footer.innerHTML=`<div class="chat-input-row">
+  const footer = document.getElementById('chat-footer');
+  if(!footer) return;
+  if(!_currentUser){
+    footer.innerHTML = `<div class="chat-login-hint">Connecte-toi pour participer au chat.</div>`;
+    return;
+  }
+  footer.innerHTML = `<div class="chat-input-row">
     <textarea class="chat-input" id="chat-input" placeholder="Écris un message…" rows="1"
       onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatSend();}"
       oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,80)+'px'"></textarea>
     <button class="chat-send" id="chat-send-btn" onclick="chatSend()">➤</button>
   </div>
-  <div style="font-family:var(--ff-mono);font-size:8px;color:var(--t5);margin-top:5px;text-align:center">Messages supprimés après 5h</div>`;
+  <div style="font-family:var(--ff-mono);font-size:8px;color:var(--t5);margin-top:5px;text-align:center">Messages conservés 72h</div>`;
 }
+
 async function chatSend(){
-  if(!_currentUser||!_ablyReady) return;
-  const input=document.getElementById('chat-input'); if(!input) return;
-  const text=chatModerate(input.value);
-  if(!text){ input.value=''; return; }
-  const btn=document.getElementById('chat-send-btn'); if(btn) btn.disabled=true;
-  input.value=''; input.style.height='auto';
+  if(!_currentUser || !_ablyReady) return;
+  const input = document.getElementById('chat-input');
+  if(!input) return;
+  const raw = chatModerate(input.value);
+  if(!raw){ input.value=''; return; }
+  const btn = document.getElementById('chat-send-btn');
+  if(btn) btn.disabled = true;
+  input.value = ''; input.style.height = 'auto';
   try{
-    const msg={ts:Date.now(),author:_currentUser.name,color:_currentUser.color,text};
-    const raw2=await storageGet(CHAT_KEY,true);
-    const msgs=raw2?JSON.parse(raw2.value):[];
-    const fresh=msgs.filter(m=>(Date.now()-m.ts)<CHAT_TTL);
-    fresh.push(msg);
-    await storageSet(CHAT_KEY,JSON.stringify(fresh.slice(-CHAT_MAX)),true);
-    _chatMsgs=fresh.slice(-CHAT_MAX); _chatLastSeen=msg.ts;
-    chatRenderMessages();
-    // Force immediate refresh for faster feedback
-    setTimeout(()=>_runUnifiedPoll(),500);
-  }catch(e){}finally{ if(btn) btn.disabled=false; input.focus(); }
+    const msg = {ts: Date.now(), author: _currentUser.name, color: _currentUser.color, text: raw};
+    // Publier sur le canal Ably — reçu instantanément par tous via subscribe
+    await _ablyChannel('ecg:chat').publish('msg', msg);
+    // Ajouter localement immédiatement (avant de le recevoir en retour)
+    const exists = _chatMsgs.some(x=>x.ts===msg.ts&&x.author===msg.author);
+    if(!exists){
+      _chatMsgs.push(msg);
+      _chatMsgs = _chatMsgs.slice(-CHAT_MAX);
+      _chatLastSeen = msg.ts;
+      chatRenderMessages();
+    }
+  }catch(e){ console.warn('[Chat] send error:', e); }
+  finally{ if(btn) btn.disabled=false; input.focus(); }
 }
+
 
 // ══════════════════════════════════════════════════════════════════
 //  REACTIONS (notes collaboratives)

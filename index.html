@@ -900,7 +900,7 @@ function _updateBestStreak(s){ try{ const b=_getStoredBestStreak(); if(s>b) loca
 //  TIMER
 // ══════════════════════════════════════════════════════════════════
 function startTimer(){
-  const TARGET=new Date('2026-04-14T08:00:00').getTime();
+  const TARGET=new Date('2026-04-14T01:00:00').getTime();
   function updateCountdown(){
     const now=Date.now();
     const diff=TARGET-now;
@@ -1120,7 +1120,7 @@ function renderHome(container){
     // Update hero countdown
     const hc=document.getElementById('hero-countdown');
     if(hc){
-      const diff=new Date('2026-04-14T08:00:00').getTime()-Date.now();
+      const diff=new Date('2026-04-14T01:00:00').getTime()-Date.now();
       if(diff>0){ const d=Math.floor(diff/(1000*60*60*24)); hc.textContent=d+'j'; }
       else hc.textContent='J-0';
     }
@@ -2551,6 +2551,8 @@ async function renderScoreboard(container){
     const el=document.getElementById('sb-content');
     if(el) sbRenderList(el, users);
   });
+  // Hydrater aussi immédiatement les joueurs actuellement en présence
+  Object.keys(_presenceMembers).forEach(name => _hydrateScoreboardUserByName(name));
   updateOnlineCount();
 }
 
@@ -2968,6 +2970,8 @@ function _onPresenceEvent(member){
   } else {
     // enter / update / present
     _presenceMembers[name] = member.data;
+    // Important : un joueur réellement en ligne doit apparaître même si l'index KV est en retard.
+    if(!_usersCache.some(u=>u && u.name===name)) _hydrateScoreboardUserByName(name);
   }
   updateOnlineCount();
 }
@@ -3151,35 +3155,47 @@ async function sbPushMyStats(extra={}){
   }catch(e){}finally{ _sbPushInProgress = false; }
 }
 
+function _upsertScoreboardUser(u, forceRender=false){
+  if(!u?.name) return;
+  if(u.scoreboardActive === false){
+    _usersCache = _usersCache.filter(x=>x.name!==u.name);
+  } else {
+    const idx = _usersCache.findIndex(x=>x.name===u.name);
+    if(idx>=0) _usersCache[idx] = u;
+    else _usersCache.push(u);
+    _usersCache = _usersCache.filter(x=>x && x.name && x.scoreboardActive !== false);
+  }
+  _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
+  _usersCacheTs = Date.now();
+  const sbContent = document.getElementById('sb-content');
+  if(sbContent && _currentView === 'scoreboard' && forceRender){
+    sbRenderList(sbContent, _usersCache);
+  } else if(sbContent && _currentView === 'scoreboard'){
+    sbRenderList(sbContent, _usersCache);
+  } else {
+    _patchScoreboardRow(u);
+  }
+}
+
+async function _hydrateScoreboardUserByName(name, attempt=0){
+  if(!name) return;
+  try{
+    const raw = await storageGet(sbUserKey(name), true);
+    if(raw){
+      const u = JSON.parse(raw.value);
+      if(u?.name) { _upsertScoreboardUser(u, true); return; }
+    }
+  }catch(e){}
+  if(attempt < 3){
+    setTimeout(()=>{ _hydrateScoreboardUserByName(name, attempt+1); }, [500, 1200, 2500][attempt] || 2500);
+  }
+}
+
 function _onAblyUserUpdate(value){
   try{
     const u = JSON.parse(value);
     if(!u?.name) return;
-
-    const sbContent = document.getElementById('sb-content');
-
-    if(u.scoreboardActive === false){
-      _usersCache = _usersCache.filter(x=>x.name!==u.name);
-      _usersCacheTs = Date.now();
-      if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
-      return;
-    }
-
-    const idx = _usersCache.findIndex(x=>x.name===u.name);
-    if(idx>=0) _usersCache[idx] = u;
-    else _usersCache.push(u);
-
-    _usersCache = _usersCache.filter(x=>x && x.name && x.scoreboardActive !== false);
-    _usersCache.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
-    _usersCacheTs = Date.now();
-
-    // Important : si un autre joueur arrive après le rendu initial,
-    // il faut rerendre la liste complète pour créer sa ligne DOM.
-    if(sbContent && _currentView === 'scoreboard'){
-      sbRenderList(sbContent, _usersCache);
-    }else{
-      _patchScoreboardRow(u);
-    }
+    _upsertScoreboardUser(u, true);
   }catch(e){}
 }
 
@@ -3198,6 +3214,9 @@ async function _fetchAllUsers(force=false){
         (idx.keys||[]).forEach(k => { if(k && k !== 'ecg_math_users:index') keySet.add(k); });
       }catch(e){}
     }
+    // Filet de sécurité : les membres actuellement en présence doivent aussi être cherchés.
+    Object.keys(_presenceMembers).forEach(name => keySet.add(sbUserKey(name)));
+    if(_currentUser?.name) keySet.add(sbUserKey(_currentUser.name));
 
     const keys = Array.from(keySet);
     if(!keys.length){
@@ -3223,10 +3242,8 @@ async function _fetchAllUsers(force=false){
     });
 
     const users = Array.from(byName.values()).filter(u => u.scoreboardActive !== false);
-    // Tous les users restent dans le scoreboard — seul sbLogout les masque explicitement
     _usersCache = users.sort((a,b)=>(b.scores?.total||0)-(a.scores?.total||0));
     _usersCacheTs = now;
-    // Mettre à jour le scoreboard si ouvert
     const sbContent = document.getElementById('sb-content');
     if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
   }catch(e){}
@@ -3308,11 +3325,7 @@ function updateOnlineCount(){
 
 function _patchScoreboardRow(u){
   const row = document.getElementById('sb-row-'+u.name);
-  if(!row){
-    const sbContent = document.getElementById('sb-content');
-    if(sbContent && _currentView === 'scoreboard') sbRenderList(sbContent, _usersCache);
-    return;
-  }
+  if(!row) return;
   const scoreEl = row.querySelector('.sb-score-val');
   if(scoreEl) scoreEl.textContent = Math.round(u.scores?.total||0)+'%';
 }
